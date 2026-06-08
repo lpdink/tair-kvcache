@@ -43,6 +43,7 @@ services:
       - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
       - ./grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/kvcm.yml:ro
       - ./grafana-dashboard.json:/var/lib/grafana/dashboards/kvcm-hit-rate.json:ro
+      - ./grafana-dashboard-per-instance.json:/var/lib/grafana/dashboards/kvcm-hit-rate-per-instance.json:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
