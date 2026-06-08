@@ -127,6 +127,12 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         logger.warning("KVCM vllm connector version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUILD_TIME)
 
         self._extra_config = TairKvCacheConnectorExtraConfig(vllm_config.kv_transfer_config.kv_connector_extra_config)
+
+        # Apply log level from config (priority: config param > env var > default WARNING)
+        if self._extra_config.log_level:
+            from kv_cache_manager.py_connector.common.logger import set_log_level
+            set_log_level(self._extra_config.log_level)
+
         self._kv_caches: Optional[dict[str, torch.Tensor]] = None
         self._local_block_size = vllm_config.cache_config.block_size
 
@@ -398,8 +404,9 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         self._per_layer_token_key_byte_size = (first_layer_kvcache.shape[3] *
                                                first_layer_kvcache.shape[4] * self._dtype.itemsize)
         assert self._per_layer_token_key_byte_size == first_layer_kvcache[0][0][1].data_ptr() - \
-               first_layer_kvcache[0][0][0].data_ptr(), "kv cache shape error"
-        assert self._per_manager_location_spec_layer_byte_size == 2 * self._manager_block_size * self._per_layer_token_key_byte_size
+            first_layer_kvcache[0][0][0].data_ptr(), "kv cache shape error"
+        assert self._per_manager_location_spec_layer_byte_size == 2 * \
+            self._manager_block_size * self._per_layer_token_key_byte_size
 
         self._per_manager_location_spec_shape = [len(self._kv_caches)] + self._per_manager_location_spec_layer_shape
         self._per_manager_location_spec_byte_size = math.prod(
@@ -459,7 +466,6 @@ class TairKvCacheConnector(KVConnectorBase_V1):
 
         logger.warning("register_kv_caches, _per_manager_location_spec_layer_shape: %s",
                        self._per_manager_location_spec_layer_shape)
-
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
