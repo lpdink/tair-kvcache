@@ -191,6 +191,13 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
     return true;
 }
 
+void CacheManager::SetRevisitHistogramConfig(const std::vector<double> &boundaries) {
+    if (meta_indexer_manager_ && metrics_registry_ && !boundaries.empty()) {
+        meta_indexer_manager_->SetRevisitHistogramConfig(metrics_registry_, boundaries);
+        KVCM_LOG_INFO("Set revisit histogram config with %zu boundaries", boundaries.size());
+    }
+}
+
 std::pair<ErrorCode, std::string>
 CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::string &instance_group,
