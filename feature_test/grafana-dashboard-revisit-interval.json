@@ -1,0 +1,233 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Bucket Distribution (%) — $instance_id",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 0 },
+      "datasource": { "uid": "prometheus", "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "palette-classic" },
+          "thresholds": { "mode": "absolute", "steps": [
+            {"color": "green", "value": null}
+          ]}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "expr": "increase(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"1.0\"}[$__range]) / ignoring(le) increase(kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"}[$__range])",
+          "legendFormat": "≤1s",
+          "instant": true,
+          "refId": "A"
+        },
+        {
+          "expr": "(increase(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"5.0\"}[$__range]) - ignoring(le) increase(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"1.0\"}[$__range])) / ignoring(le) increase(kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"}[$__range])",
+          "legendFormat": "1-5s",
+          "instant": true,
+          "refId": "B"
+        },
+        {
+          "expr": "(increase(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"30.0\"}[$__range]) - ignoring(le) increase(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"5.0\"}[$__range])) / ignoring(le) increase(kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"}[$__range])",
+          "legendFormat": "5-30s",
+          "instant": true,
+          "refId": "C"
+        },
+        {
+          "expr": "(increase(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"60.0\"}[$__range]) - ignoring(le) increase(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"30.0\"}[$__range])) / ignoring(le) increase(kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"}[$__range])",
+          "legendFormat": "30-60s",
+          "instant": true,
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "title": "Observation Count",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 0 },
+      "datasource": { "uid": "prometheus", "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "thresholds": { "mode": "absolute", "steps": [
+            {"color": "blue", "value": null}
+          ]}
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "horizontal",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "kvcm_revisit_interval_seconds_count{instance_id=~\".+\"}",
+          "legendFormat": "{{instance_id}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "title": "All Instances — Bucket % Comparison",
+      "type": "barchart",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 8 },
+      "datasource": { "uid": "prometheus", "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": { "mode": "normal", "group": "comparison" }
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "barWidth": 0.5,
+        "groupWidth": 0.7,
+        "showValue": "always",
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "increase(kvcm_revisit_interval_seconds_bucket{instance_id=~\".+\",le=\"1.0\"}[$__range]) / ignoring(le) increase(kvcm_revisit_interval_seconds_count{instance_id=~\".+\"}[$__range])",
+          "legendFormat": "{{instance_id}} ≤1s"
+        },
+        {
+          "expr": "(increase(kvcm_revisit_interval_seconds_bucket{instance_id=~\".+\",le=\"5.0\"}[$__range]) - ignoring(le) increase(kvcm_revisit_interval_seconds_bucket{instance_id=~\".+\",le=\"1.0\"}[$__range])) / ignoring(le) increase(kvcm_revisit_interval_seconds_count{instance_id=~\".+\"}[$__range])",
+          "legendFormat": "{{instance_id}} 1-5s"
+        },
+        {
+          "expr": "(increase(kvcm_revisit_interval_seconds_bucket{instance_id=~\".+\",le=\"30.0\"}[$__range]) - ignoring(le) increase(kvcm_revisit_interval_seconds_bucket{instance_id=~\".+\",le=\"5.0\"}[$__range])) / ignoring(le) increase(kvcm_revisit_interval_seconds_count{instance_id=~\".+\"}[$__range])",
+          "legendFormat": "{{instance_id}} 5-30s"
+        },
+        {
+          "expr": "(increase(kvcm_revisit_interval_seconds_bucket{instance_id=~\".+\",le=\"60.0\"}[$__range]) - ignoring(le) increase(kvcm_revisit_interval_seconds_bucket{instance_id=~\".+\",le=\"30.0\"}[$__range])) / ignoring(le) increase(kvcm_revisit_interval_seconds_count{instance_id=~\".+\"}[$__range])",
+          "legendFormat": "{{instance_id}} 30-60s"
+        }
+      ]
+    },
+    {
+      "title": "P50 / P90 / P99 — $instance_id",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "uid": "prometheus", "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "pointSize": 5, "showPoints": "auto" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\"}[1m])) by (le))",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\"}[1m])) by (le))",
+          "legendFormat": "P90"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\"}[1m])) by (le))",
+          "legendFormat": "P99"
+        }
+      ]
+    },
+    {
+      "title": "Bucket % Over Time — $instance_id",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "uid": "prometheus", "type": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean"] }
+      },
+      "targets": [
+        {
+          "expr": "rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"1.0\"}[1m]) / ignoring(le) rate(kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"}[1m])",
+          "legendFormat": "≤1s"
+        },
+        {
+          "expr": "(rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"5.0\"}[1m]) - ignoring(le) rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"1.0\"}[1m])) / ignoring(le) rate(kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"}[1m])",
+          "legendFormat": "1-5s"
+        },
+        {
+          "expr": "(rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"30.0\"}[1m]) - ignoring(le) rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"5.0\"}[1m])) / ignoring(le) rate(kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"}[1m])",
+          "legendFormat": "5-30s"
+        },
+        {
+          "expr": "(rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"60.0\"}[1m]) - ignoring(le) rate(kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\",le=\"30.0\"}[1m])) / ignoring(le) rate(kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"}[1m])",
+          "legendFormat": "30-60s"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 40,
+  "tags": ["kvcm", "histogram", "revisit-interval"],
+  "templating": {
+    "list": [
+      {
+        "name": "instance_id",
+        "type": "custom",
+        "current": { "text": "Qwen3.7-Max", "value": "Qwen3.7-Max" },
+        "options": [
+          { "text": "Qwen3.7-Max", "value": "Qwen3.7-Max", "selected": true },
+          { "text": "GLM-5.1", "value": "GLM-5.1", "selected": false },
+          { "text": "DeepSeek-V4-Pro", "value": "DeepSeek-V4-Pro", "selected": false }
+        ],
+        "query": "Qwen3.7-Max,GLM-5.1,DeepSeek-V4-Pro",
+        "label": "Instance",
+        "hide": 0,
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": { "refresh_intervals": ["10s", "30s", "1m"] },
+  "timezone": "browser",
+  "title": "KVCacheManager — Revisit Interval Histogram",
+  "uid": "kvcm-revisit-interval"
+}
