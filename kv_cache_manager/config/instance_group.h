@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/config/cache_config.h"
@@ -41,6 +42,12 @@ public:
     void set_version(int64_t version) { version_ = version; }
     const std::string &extra_info() const { return extra_info_; }
     void set_extra_info(const std::string &extra_info) { extra_info_ = extra_info; }
+    const std::string &revisit_interval_buckets() const { return revisit_interval_buckets_; }
+    void set_revisit_interval_buckets(const std::string &buckets) { revisit_interval_buckets_ = buckets; }
+
+    // Parse revisit_interval_buckets string into sorted vector of doubles.
+    // Returns empty vector if the string is empty or invalid.
+    static std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str);
 
 private:
     std::string name_;
@@ -52,6 +59,7 @@ private:
     std::string user_data_;
     int64_t version_;
     std::string extra_info_;
+    std::string revisit_interval_buckets_;
 };
 
 } // namespace kv_cache_manager

@@ -1,5 +1,11 @@
 #include "kv_cache_manager/config/instance_group.h"
 
+#include <cmath>
+#include <sstream>
+
+#include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/string_util.h"
+
 namespace kv_cache_manager {
 
 InstanceGroup::~InstanceGroup() = default;
@@ -14,6 +20,7 @@ bool InstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "user_data", user_data_);
     KVCM_JSON_GET_MACRO(rapid_value, "version", version_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "extra_info", extra_info_, std::string(""));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "revisit_interval_buckets", revisit_interval_buckets_, std::string(""));
     return true;
 }
 
@@ -27,6 +34,7 @@ void InstanceGroup::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wr
     Put(writer, "user_data", user_data_);
     Put(writer, "version", version_);
     Put(writer, "extra_info", extra_info_);
+    Put(writer, "revisit_interval_buckets", revisit_interval_buckets_);
 }
 
 bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -59,4 +67,43 @@ bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {
     }
     return valid;
 }
+
+std::vector<double> InstanceGroup::ParseRevisitIntervalBuckets(const std::string &buckets_str) {
+    std::vector<double> boundaries;
+    if (buckets_str.empty()) {
+        return boundaries;
+    }
+    std::istringstream iss(buckets_str);
+    std::string token;
+
+    while (std::getline(iss, token, ',')) {
+        StringUtil::Trim(token);
+        if (token.empty()) {
+            return {};  // reject empty tokens (e.g. "1,,5")
+        }
+        try {
+            size_t pos = 0;
+            double val = std::stod(token, &pos);
+            if (pos != token.size()) {
+                return {};  // reject partial consumption (e.g. "1s")
+            }
+            if (val <= 0.0 || !std::isfinite(val)) {
+                return {};
+            }
+            boundaries.push_back(val);
+        } catch (const std::exception &) {
+            return {};
+        }
+    }
+
+    // Check strictly ascending order
+    for (size_t i = 1; i < boundaries.size(); ++i) {
+        if (boundaries[i] <= boundaries[i - 1]) {
+            return {};
+        }
+    }
+
+    return boundaries;
+}
+
 } // namespace kv_cache_manager
