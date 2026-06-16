@@ -42,12 +42,17 @@ public:
     void set_version(int64_t version) { version_ = version; }
     const std::string &extra_info() const { return extra_info_; }
     void set_extra_info(const std::string &extra_info) { extra_info_ = extra_info; }
-    const std::string &revisit_interval_buckets() const { return revisit_interval_buckets_; }
-    void set_revisit_interval_buckets(const std::string &buckets) { revisit_interval_buckets_ = buckets; }
 
-    // Parse revisit_interval_buckets string into sorted vector of doubles.
-    // Returns empty vector if the string is empty or invalid.
-    static std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str);
+    // Revisit interval histogram bucket boundaries (parsed, validated).
+    // Empty vector means "use server-level default".
+    const std::vector<double> &revisit_interval_buckets() const { return parsed_revisit_interval_buckets_; }
+
+    // Set from raw config string. Parses and validates immediately.
+    // On parse failure, logs a warning and stores empty vector (fallback to default).
+    void set_revisit_interval_buckets(const std::string &buckets_str);
+
+    // Raw string for JSON serialization (preserves original config text).
+    const std::string &revisit_interval_buckets_raw() const { return revisit_interval_buckets_str_; }
 
 private:
     std::string name_;
@@ -59,7 +64,8 @@ private:
     std::string user_data_;
     int64_t version_;
     std::string extra_info_;
-    std::string revisit_interval_buckets_;
+    std::string revisit_interval_buckets_str_;               // raw string for JSON wire format
+    std::vector<double> parsed_revisit_interval_buckets_;     // parsed, validated boundaries
 };
 
 } // namespace kv_cache_manager
