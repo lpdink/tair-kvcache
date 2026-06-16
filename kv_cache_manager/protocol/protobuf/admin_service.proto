@@ -249,6 +249,7 @@ message InstanceGroup {
     string user_data = 7;
     int64 version = 8;
     string extra_info = 9; // opaque JSON passed through to clients
+    string revisit_interval_buckets = 10; // comma-separated bucket boundaries in seconds (e.g. "1,5,30,60")
 }
 
 message CreateInstanceGroupRequest {

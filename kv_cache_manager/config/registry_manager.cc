@@ -434,15 +434,6 @@ ErrorCode RegistryManager::LoadConfigSnapshot(RequestContext *request_context, c
     return EC_UNIMPLEMENTED;
 }
 
-CacheConfigConstPtr RegistryManager::GetCacheConfig(const std::string &instance_group) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    auto it = instance_group_configs_.find(instance_group);
-    if (it != instance_group_configs_.end()) {
-        return it->second->cache_config();
-    }
-    return nullptr;
-}
-
 std::shared_ptr<DataStorageManager> RegistryManager::data_storage_manager() const { return data_storage_manager_; }
 
 ErrorCode RegistryManager::LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {

@@ -297,6 +297,7 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
     proto_instance_group->set_user_data(instance_group_info.user_data());
     proto_instance_group->set_version(instance_group_info.version());
     proto_instance_group->set_extra_info(instance_group_info.extra_info());
+    proto_instance_group->set_revisit_interval_buckets(instance_group_info.revisit_interval_buckets_raw());
 }
 void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *proto_instance_group,
                                           InstanceGroup &instance_group_info) {
@@ -335,6 +336,7 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
     instance_group_info.set_user_data(proto_instance_group->user_data());
     instance_group_info.set_version(proto_instance_group->version());
     instance_group_info.set_extra_info(proto_instance_group->extra_info());
+    instance_group_info.set_revisit_interval_buckets(proto_instance_group->revisit_interval_buckets());
 }
 
 void ProtoConvert::AccountFromProto(const proto::admin::Account *proto_account, Account &account_info) {
