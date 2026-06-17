@@ -1,0 +1,55 @@
+# Integration test: Per-group revisit interval bucket configuration
+#
+# Usage:
+#   cd tair-kvcache
+#   docker compose -f feature_test/docker-compose-test.yaml up -d
+#   python3 feature_test/test_per_group_buckets.py
+#   docker compose -f feature_test/docker-compose-test.yaml down
+
+services:
+  kvcm:
+    image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:latest
+    container_name: kvcm-test
+    network_mode: host
+    working_dir: /workspace/tair-kvcache
+    volumes:
+      - ..:/workspace
+      - kvcm-cache:/root/.cache
+    environment:
+      - USE_BAZEL_VERSION=6.4.0
+      - BAZELISK_BASE_URL=https://mirrors.huaweicloud.com/bazel/
+    command: >
+      bash -c "
+        bazelisk run --jobs=8 //kv_cache_manager:main -- -c /workspace/feature_test/kvcm_server_config.conf
+      "
+    restart: unless-stopped
+
+  prometheus:
+    image: registry.cn-hangzhou.aliyuncs.com/8bitpd/prometheus:v3.5.0
+    container_name: kvcm-prometheus
+    network_mode: host
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - kvcm
+    restart: unless-stopped
+
+  grafana:
+    image: registry.cn-hangzhou.aliyuncs.com/8bitpd/grafana:11.5
+    container_name: kvcm-grafana
+    network_mode: host
+    volumes:
+      - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/kvcm.yml:ro
+      - ./grafana-dashboard-per-group.json:/var/lib/grafana/dashboards/kvcm-per-group.json:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_HTTP_PORT=12111
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  kvcm-cache:
+    external: true

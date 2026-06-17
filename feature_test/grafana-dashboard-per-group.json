@@ -1,0 +1,68 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Bucket Boundaries per Instance",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "count by (instance_id, le) (kvcm_revisit_interval_seconds_bucket{le!=\"+Inf\"})",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "instance_id": "Instance", "le": "Bucket Boundary (le)", "Value": "Count" } } }
+      ]
+    },
+    {
+      "title": "Observation Count per Instance",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "kvcm_revisit_interval_seconds_count",
+          "legendFormat": "{{instance_id}}"
+        }
+      ]
+    },
+    {
+      "title": "Bucket Distribution (%) — $instance_id",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 13 },
+      "targets": [
+        {
+          "expr": "kvcm_revisit_interval_seconds_bucket{instance_id=\"$instance_id\", le!=\"+Inf\"} / ignoring(le) group_left kvcm_revisit_interval_seconds_count{instance_id=\"$instance_id\"} * 100",
+          "legendFormat": "le={{le}}"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["kvcm", "revisit-interval"],
+  "templating": {
+    "list": [
+      {
+        "name": "instance_id",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(kvcm_revisit_interval_seconds_count, instance_id)",
+        "refresh": 2
+      }
+    ]
+  },
+  "time": { "from": "now-30m", "to": "now" },
+  "title": "KVCacheManager - Per-Group Revisit Interval Buckets",
+  "uid": "kvcm-per-group"
+}
