@@ -10,6 +10,7 @@ Tests cover:
 """
 
 import copy
+import ctypes
 import math
 import sys
 import threading
@@ -168,6 +169,7 @@ def _make_hybrid_kv_cache(num_layers, num_blocks, page_size_bytes):
 
     Each layer gets [conv_state, ssm_state] sharing the same untyped_storage,
     simulating vllm's initialize_kv_cache_tensors behavior.
+    Conv and ssm states are at non-overlapping offsets in the storage.
     """
     kv_caches = {}
     total_bytes_per_block = page_size_bytes
@@ -176,15 +178,27 @@ def _make_hybrid_kv_cache(num_layers, num_blocks, page_size_bytes):
         name = f"model.layers.{num_layers + i}.mamba"
         # Create a raw tensor that holds both conv and ssm state
         raw = torch.zeros(num_blocks, total_bytes_per_block, dtype=torch.uint8, device="cpu")
-        # conv_state view (first half)
         conv_bytes = total_bytes_per_block // 2
-        conv_state = torch.tensor([], dtype=torch.uint8, device="cpu").set_(
-            raw.untyped_storage()
-        ).view(num_blocks, conv_bytes)
-        # ssm_state view (second half)
-        ssm_state = torch.tensor([], dtype=torch.uint8, device="cpu").set_(
-            raw.untyped_storage()
-        ).view(num_blocks, total_bytes_per_block)
+        ssm_bytes = total_bytes_per_block - conv_bytes
+
+        # conv_state: view into first half of each block
+        # Use as_strided to create a view with proper offset/stride
+        conv_state = torch.as_strided(
+            raw,
+            size=(num_blocks, conv_bytes),
+            stride=(total_bytes_per_block, 1),
+        )
+        # ssm_state: view into second half of each block
+        ssm_state = torch.as_strided(
+            raw,
+            size=(num_blocks, ssm_bytes),
+            stride=(total_bytes_per_block, 1),
+            storage_offset=conv_bytes,
+        )
+
+        # Fill with distinct patterns so we can verify round-trip
+        conv_state.fill_(i + 1)  # layer 0 = 1, layer 1 = 2, ...
+        ssm_state.fill_(i + 100)  # layer 0 = 100, layer 1 = 101, ...
         kv_caches[name] = [conv_state, ssm_state]
     return kv_caches
 
@@ -679,6 +693,363 @@ class TestBackwardCompatibility(unittest.TestCase):
 
         self.assertEqual(location_spec_groups, [])
         self.assertEqual(len(location_spec_infos), 1)
+
+
+# ============================================================================
+# Test: register_kv_caches heterogeneous dict (core entry point)
+# ============================================================================
+
+class TestRegisterKvCaches(unittest.TestCase):
+    """Test register_kv_caches with heterogeneous dict[str, Tensor | list[Tensor]]."""
+
+    def test_heterogeneous_dict_separation(self):
+        """Heterogeneous dict correctly separates attention and hybrid layers."""
+        attn_caches = _make_attn_kv_cache(2, 10, 16, 8, 128, torch.bfloat16)
+        hybrid_caches = _make_hybrid_kv_cache(2, 10, 4096)
+        kv_caches = {**attn_caches, **hybrid_caches}
+
+        # Verify the separation logic directly
+        attn_names = []
+        hybrid_names = []
+        for name, cache in kv_caches.items():
+            if isinstance(cache, list):
+                hybrid_names.append(name)
+            else:
+                attn_names.append(name)
+
+        self.assertEqual(len(attn_names), 2)
+        self.assertEqual(len(hybrid_names), 2)
+        # Attention layers come first (from _make_attn_kv_cache)
+        self.assertTrue(all("self_attn" in n for n in attn_names))
+        self.assertTrue(all("mamba" in n for n in hybrid_names))
+
+    def test_hybrid_kv_cache_structure(self):
+        """Hybrid kv_cache entries are list[Tensor] with shared storage."""
+        hybrid_caches = _make_hybrid_kv_cache(2, 10, 4096)
+
+        for name, state_tensors in hybrid_caches.items():
+            self.assertIsInstance(state_tensors, list)
+            self.assertEqual(len(state_tensors), 2)  # conv_state + ssm_state
+
+            conv_state, ssm_state = state_tensors
+            # Both share the same untyped_storage
+            self.assertEqual(
+                conv_state.untyped_storage().data_ptr(),
+                ssm_state.untyped_storage().data_ptr()
+            )
+            # Shapes are correct
+            self.assertEqual(conv_state.shape[0], 10)  # num_blocks
+            self.assertEqual(ssm_state.shape[0], 10)
+
+    def test_distinct_fill_patterns(self):
+        """Conv and ssm states have distinct fill values for round-trip verification."""
+        hybrid_caches = _make_hybrid_kv_cache(3, 5, 1024)
+
+        names = list(hybrid_caches.keys())
+        for i, name in enumerate(names):
+            conv_state, ssm_state = hybrid_caches[name]
+            self.assertEqual(conv_state[0, 0].item(), i + 1)
+            self.assertEqual(ssm_state[0, 0].item(), i + 100)
+
+
+# ============================================================================
+# Test: _register_hybrid_kv_caches storage contiguity
+# ============================================================================
+
+class TestRegisterHybridKvCaches(unittest.TestCase):
+    """Test _register_hybrid_kv_caches storage contiguity assertions."""
+
+    def _make_connector(self, page_size_bytes=4096):
+        c = TairKvCacheConnector.__new__(TairKvCacheConnector)
+        c._has_hybrid = True
+        c._device = torch.device("cpu")
+        c._hybrid_page_size_bytes = page_size_bytes
+        c._kv_caches = {}
+        return c
+
+    def test_shared_storage_passes(self):
+        """conv_state and ssm_state sharing untyped_storage: assert passes."""
+        c = self._make_connector()
+        hybrid_caches = _make_hybrid_kv_cache(2, 10, 4096)
+        c._kv_caches = hybrid_caches
+        # Should not raise
+        c._register_hybrid_kv_caches(list(hybrid_caches.keys()))
+        self.assertIsNotNone(c._hybrid_info)
+
+    def test_different_storage_fails(self):
+        """conv_state and ssm_state with different untyped_storage: assert fails."""
+        c = self._make_connector()
+        # Create tensors with separate storage
+        conv = torch.zeros(10, 2048, dtype=torch.uint8)
+        ssm = torch.zeros(10, 2048, dtype=torch.uint8)  # different storage!
+        c._kv_caches = {"model.layers.0.mamba": [conv, ssm]}
+        with self.assertRaises(AssertionError):
+            c._register_hybrid_kv_caches(["model.layers.0.mamba"])
+
+    def test_non_list_value_fails(self):
+        """Hybrid layer with non-list value: assert fails."""
+        c = self._make_connector()
+        c._kv_caches = {"model.layers.0.mamba": torch.zeros(10, 100)}  # Tensor, not list
+        with self.assertRaises(AssertionError):
+            c._register_hybrid_kv_caches(["model.layers.0.mamba"])
+
+    def test_empty_list_fails(self):
+        """Hybrid layer with empty list: assert fails."""
+        c = self._make_connector()
+        c._kv_caches = {"model.layers.0.mamba": []}
+        with self.assertRaises(AssertionError):
+            c._register_hybrid_kv_caches(["model.layers.0.mamba"])
+
+    def test_storage_too_small_fails(self):
+        """Storage smaller than num_blocks * page_size_bytes: assert fails."""
+        c = self._make_connector(page_size_bytes=8192)
+        # Create a tiny storage that's too small
+        raw = torch.zeros(10, 100, dtype=torch.uint8)  # 100 bytes << 10*8192
+        state = torch.tensor([], dtype=torch.uint8).set_(raw.untyped_storage()).view(10, 100)
+        c._kv_caches = {"model.layers.0.mamba": [state, state]}
+        with self.assertRaises(AssertionError):
+            c._register_hybrid_kv_caches(["model.layers.0.mamba"])
+
+    def test_block_view_tensors_shape(self):
+        """block_view_tensors have correct (num_blocks, page_size_bytes) shape."""
+        c = self._make_connector(page_size_bytes=256)
+        hybrid_caches = _make_hybrid_kv_cache(3, 8, 256)
+        c._kv_caches = hybrid_caches
+        c._register_hybrid_kv_caches(list(hybrid_caches.keys()))
+
+        self.assertEqual(c._hybrid_info.layer_num, 3)
+        self.assertEqual(c._hybrid_info.page_size_bytes, 256)
+        for bvt in c._hybrid_info.block_view_tensors:
+            self.assertEqual(bvt.shape, (8, 256))
+
+
+# ============================================================================
+# Test: hybrid data round-trip (save gather → load scatter consistency)
+# ============================================================================
+
+class TestHybridDataRoundTrip(unittest.TestCase):
+    """Test hybrid_save_task → hybrid_load_task data consistency."""
+
+    def _make_data_transfer(self, hybrid_info):
+        from kv_cache_manager.py_connector.vllm.data_transfer import DataTransferManager
+        dt = DataTransferManager.__new__(DataTransferManager)
+        kvcache_info = MagicMock()
+        kvcache_info.hybrid_info = hybrid_info
+        kvcache_info.device = torch.device("cpu")
+        dt._kvcache_info = kvcache_info
+        dt._device_mod = MagicMock()
+        # Make stream context manager a no-op
+        dt._device_mod.stream = MagicMock(return_value=MagicMock(
+            __enter__=MagicMock(return_value=None),
+            __exit__=MagicMock(return_value=None)
+        ))
+        dt._device_mod.Event = MagicMock(return_value=MagicMock(
+            record=MagicMock(), synchronize=MagicMock()
+        ))
+        dt._save_stream = MagicMock()
+        dt._load_stream = MagicMock()
+        dt._coordinator_client = MagicMock()
+        dt._transfer_client = MagicMock()
+        return dt
+
+    def test_save_load_round_trip(self):
+        """Data saved by hybrid_save_task can be loaded back identically."""
+        # Setup: 2 hybrid layers, 4 blocks, page_size=256
+        page_size = 256
+        num_blocks = 4
+        block_views = []
+        for layer in range(2):
+            bv = torch.arange(layer * 100, layer * 100 + num_blocks * page_size,
+                              dtype=torch.uint8).view(num_blocks, page_size)
+            block_views.append(bv)
+
+        hybrid_info = HybridCacheInfo(
+            layer_names=["l0.mamba", "l1.mamba"],
+            ptr_tensor_cpu=torch.tensor([bv.data_ptr() for bv in block_views]),
+            block_view_tensors=block_views,
+            page_size_bytes=page_size,
+            layer_num=2,
+        )
+        dt = self._make_data_transfer(hybrid_info)
+
+        # Mock transfer_client to capture saved data and replay it on load
+        saved_data = {}
+        def mock_save(uris, buffers):
+            for i, uri in enumerate(uris):
+                saved_data[uri] = bytes(
+                    ctypes.string_at(buffers[i].iovs[0].base, buffers[i].iovs[0].size)
+                )
+            return [0]  # ER_OK
+        def mock_load(uris, buffers):
+            for i, uri in enumerate(uris):
+                if uri in saved_data:
+                    data = saved_data[uri]
+                    ctypes.memmove(buffers[i].iovs[0].base, data, len(data))
+            return 0  # ER_OK
+
+        dt._transfer_client.SaveKvCaches = mock_save
+        dt._transfer_client.LoadKvCaches = mock_load
+
+        # Save blocks 1 and 3
+        block_indices = [1, 3]
+        uris = ["3fs://block1", "3fs://block3"]
+        ready_event = MagicMock()
+
+        mr = MultiResult(1, lambda results: None)
+        dt.hybrid_save_task(mr, 0, uris, block_indices, ready_event)
+
+        # Verify data was saved
+        self.assertEqual(len(saved_data), 2)
+
+        # Now clear the block views and load back
+        for bv in block_views:
+            bv.fill_(0)
+
+        # Verify they're cleared
+        self.assertTrue(all(bv.sum() == 0 for bv in block_views))
+
+        mr2 = MultiResult(1, lambda results: None)
+        dt.hybrid_load_task(mr2, 0, uris, block_indices)
+
+        # Verify data is restored
+        for layer_idx in range(2):
+            for block_idx in block_indices:
+                expected = torch.arange(
+                    layer_idx * 100 + block_idx * page_size,
+                    layer_idx * 100 + (block_idx + 1) * page_size,
+                    dtype=torch.uint8
+                )
+                actual = block_views[layer_idx][block_idx]
+                self.assertTrue(torch.equal(actual, expected),
+                                f"Layer {layer_idx}, block {block_idx}: data mismatch")
+
+
+# ============================================================================
+# Test: location_spec_group_names filling
+# ============================================================================
+
+class TestLocationSpecGroupNames(unittest.TestCase):
+    """Test start_save_kvcache_async fills location_spec_group_names correctly."""
+
+    def _make_connector(self, has_hybrid):
+        c = TairKvCacheConnector.__new__(TairKvCacheConnector)
+        c._has_hybrid = has_hybrid
+        c._epoch = 1
+        c._extra_config = MagicMock()
+        c._extra_config.instance_id = "test-instance"
+        c._manager_client = MagicMock()
+        c._manager_client.start_write_cache = MagicMock(return_value={
+            "locations": [],  # empty locations → triggers early return
+            "write_session_id": "ws1",
+            "block_mask": {"offset": 0},
+        })
+        c._coordinator_client = MagicMock()
+        c._canceled_save_request_ids = []
+        c._canceled_save_request_ids_lock = threading.Lock()
+        c._waiting_to_save_requests_lock = threading.Lock()
+        c._waiting_to_save_requests = []
+        return c
+
+    def test_hybrid_model_fills_group_names(self):
+        """Hybrid model: location_spec_group_names = ['FullAndHybrid'] * N."""
+        c = self._make_connector(has_hybrid=True)
+
+        c.start_save_kvcache_async("req1", list(range(80)), 5)
+
+        # Verify the request includes location_spec_group_names
+        call_args = c._manager_client.start_write_cache.call_args[0][0]
+        self.assertIn("location_spec_group_names", call_args)
+        self.assertEqual(call_args["location_spec_group_names"],
+                         ["FullAndHybrid"] * 5)
+
+    def test_pure_attention_no_group_names(self):
+        """Pure attention: location_spec_group_names not in request."""
+        c = self._make_connector(has_hybrid=False)
+
+        c.start_save_kvcache_async("req1", list(range(80)), 5)
+
+        call_args = c._manager_client.start_write_cache.call_args[0][0]
+        self.assertNotIn("location_spec_group_names", call_args)
+
+    def test_different_target_save_nums(self):
+        """location_spec_group_names length matches target_save_num."""
+        c = self._make_connector(has_hybrid=True)
+
+        for n in [1, 10, 100]:
+            c._manager_client.start_write_cache.reset_mock()
+            c.start_save_kvcache_async("req", list(range(n * 16)), n)
+            call_args = c._manager_client.start_write_cache.call_args[0][0]
+            self.assertEqual(len(call_args["location_spec_group_names"]), n)
+
+
+# ============================================================================
+# Test: multi-task AND-merge
+# ============================================================================
+
+class TestMultiTaskANDMerge(unittest.TestCase):
+    """Test AND-merge with multiple task_results (real-world scenario)."""
+
+    OK = 0
+    ERR = 1
+
+    def _make_data_transfer(self):
+        from kv_cache_manager.py_connector.vllm.data_transfer import DataTransferManager
+        dt = DataTransferManager.__new__(DataTransferManager)
+        dt._coordinator_client = MagicMock()
+        return dt
+
+    def test_save_multi_task_flatten_order(self):
+        """Multiple tasks with multiple blocks: flatten order is correct."""
+        dt = self._make_data_transfer()
+        cb = dt.create_save_done_callback(
+            req_id="req1", tp_rank=0, write_session_id="ws1",
+            attn_block_count=4, hybrid_block_count=4
+        )
+        # 2 attn tasks (2 blocks each) + 2 hybrid tasks (2 blocks each)
+        cb([[self.OK, self.OK], [self.OK, self.ERR],    # attn: [T,T,T,F]
+            [self.OK, self.OK], [self.OK, self.OK]])    # hybrid: [T,T,T,T]
+
+        msg = CoordinateMsgSerializer.loads(
+            dt._coordinator_client.send.call_args[0][0])
+        # AND-merge: attn[3]=F → block 3 fails
+        self.assertEqual(msg.content.is_success_list, [True, True, True, False])
+
+    def test_load_multi_task_flatten_order(self):
+        """Multiple tasks: failed_block_idxs correctly mapped."""
+        dt = self._make_data_transfer()
+        local_block_ids = [10, 11, 12, 13]
+        cb = dt.create_load_done_callback(
+            req_id="req1", tp_rank=0, epoch=1,
+            local_block_ids=local_block_ids,
+            attn_block_count=4, hybrid_block_count=4
+        )
+        # 2 attn tasks + 2 hybrid tasks
+        cb([[self.OK, self.OK], [self.OK, self.OK],     # attn: all OK
+            [self.OK, self.ERR], [self.OK, self.OK]])   # hybrid: block 1 fails
+
+        msg = CoordinateMsgSerializer.loads(
+            dt._coordinator_client.send.call_args[0][0])
+        self.assertEqual(msg.content.failed_block_idxs, [11])
+
+
+# ============================================================================
+# Test: naming conventions
+# ============================================================================
+
+class TestNamingConventions(unittest.TestCase):
+    """Test helper method naming conventions."""
+
+    def test_hybrid_spec_name(self):
+        """_tp_rank_to_hybrid_spec_name returns 'tp{rank}_hybrid'."""
+        c = TairKvCacheConnector.__new__(TairKvCacheConnector)
+        self.assertEqual(c._tp_rank_to_hybrid_spec_name(0), "tp0_hybrid")
+        self.assertEqual(c._tp_rank_to_hybrid_spec_name(3), "tp3_hybrid")
+
+    def test_attn_spec_name(self):
+        """_tp_rank_to_spec_name returns 'tp{rank}'."""
+        c = TairKvCacheConnector.__new__(TairKvCacheConnector)
+        self.assertEqual(c._tp_rank_to_spec_name(0), "tp0")
+        self.assertEqual(c._tp_rank_to_spec_name(7), "tp7")
 
 
 if __name__ == "__main__":
