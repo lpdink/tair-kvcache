@@ -171,26 +171,41 @@ class DataTransferManager:
         self._copy_buffer_allocator.free_buffer(copy_buffer_indices)
         multi_result.submit_result(task_idx, [transfer_result] * len(remote_uris))
 
-    def create_load_done_callback(self, req_id, tp_rank, epoch, local_block_ids):
-        """创建加载完成回调函数
+    def create_load_done_callback(self, req_id, tp_rank, epoch, local_block_ids,
+                                  attn_block_count=0, hybrid_block_count=0):
+        """Create load done callback.
 
         Args:
-            req_id: 请求ID
+            req_id: Request ID
             tp_rank: TP rank
-            epoch
-            local_block_ids: 本地块ID列表
-
-        Returns:
-            回调函数
+            epoch: Current epoch
+            local_block_ids: Local block ID list (length = attn_block_count)
+            attn_block_count: Number of attention blocks (for AND-merge with hybrid)
+            hybrid_block_count: Number of hybrid blocks (0 for pure attention)
         """
         def generate_message(task_results):
-            failed_block_idxs = []
-            idx = 0
+            # Flatten all task results into a single list
+            all_successes = []
             for task_result in task_results:
                 for block_result in task_result:
-                    if block_result != kvcm_py_client.ClientErrorCode.ER_OK:
-                        failed_block_idxs.append(local_block_ids[idx])
-                    idx += 1
+                    all_successes.append(block_result == kvcm_py_client.ClientErrorCode.ER_OK)
+
+            if hybrid_block_count > 0 and attn_block_count > 0:
+                # AND-merge: block i is fully loaded only if both attention and hybrid succeed
+                attn_successes = all_successes[:attn_block_count]
+                hybrid_successes = all_successes[attn_block_count:]
+                assert len(hybrid_successes) == attn_block_count, \
+                    f"hybrid_block_count ({len(hybrid_successes)}) != attn_block_count ({attn_block_count})"
+                merged_successes = [
+                    attn_successes[i] and hybrid_successes[i]
+                    for i in range(attn_block_count)
+                ]
+            else:
+                merged_successes = all_successes
+
+            failed_block_idxs = [
+                local_block_ids[i] for i, ok in enumerate(merged_successes) if not ok
+            ]
 
             msg = CoordinateMessage(
                 time.time(),
@@ -282,6 +297,8 @@ class DataTransferManager:
                 # AND-merge: attention[i] AND hybrid[i] → block i is fully saved
                 attn_successes = all_successes[:attn_block_count]
                 hybrid_successes = all_successes[attn_block_count:]
+                assert len(hybrid_successes) == attn_block_count, \
+                    f"hybrid_block_count ({len(hybrid_successes)}) != attn_block_count ({attn_block_count})"
                 is_successes = [
                     attn_successes[i] and hybrid_successes[i]
                     for i in range(attn_block_count)
@@ -390,7 +407,11 @@ class DataTransferManager:
 
         copy_done_event.synchronize()
 
-        cpu_buffer = gpu_buffer.to("cpu")
+        # Use pinned memory for efficient D2H transfer
+        cpu_buffer = torch.empty(len(block_indices) * per_block_bytes, dtype=torch.uint8,
+                                 device="cpu", pin_memory=True)
+        cpu_buffer.copy_(gpu_buffer, non_blocking=True)
+        self._device_mod.current_stream().synchronize()
 
         buffers = []
         for i in range(len(remote_uris)):

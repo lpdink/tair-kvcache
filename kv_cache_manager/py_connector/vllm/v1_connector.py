@@ -554,7 +554,6 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         We reconstruct a (num_blocks, page_size_bytes) byte view for opaque block transfer.
         """
         device = self._device
-        dtype_size = torch.uint8().element_size()
         block_view_tensors = []
         ptr_list = []
 
@@ -652,6 +651,9 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 if len(hybrid_uris) > 0:
                     hybrid_block_indices = self.generate_hybrid_block_indices(
                         load_req.manager_block_idxes, load_req.local_block_ids)
+                    assert len(hybrid_uris) == len(hybrid_block_indices), \
+                        f"hybrid_uris ({len(hybrid_uris)}) != hybrid_block_indices ({len(hybrid_block_indices)}), " \
+                        f"locations may have mixed Full/FullAndHybrid groups"
 
             # Total tasks = attention tasks + hybrid tasks (merged into one MultiResult)
             attn_task_num = math.ceil(len(block_token_indices) / per_task_size)
@@ -662,7 +664,9 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 load_req.req_id,
                 self._kvcache_info.tp_rank,
                 meta.epoch,
-                copy.copy(load_req.local_block_ids)
+                copy.copy(load_req.local_block_ids),
+                attn_block_count=len(block_token_indices),
+                hybrid_block_count=len(hybrid_uris)
             )
             multi_result = MultiResult(total_task_num, done_callback)
 
@@ -722,6 +726,9 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 if len(hybrid_uris) > 0:
                     hybrid_block_indices = self.generate_hybrid_block_indices(
                         req_save.manager_block_idxes, req.local_block_ids)
+                    assert len(hybrid_uris) == len(hybrid_block_indices), \
+                        f"hybrid_uris ({len(hybrid_uris)}) != hybrid_block_indices ({len(hybrid_block_indices)}), " \
+                        f"locations may have mixed Full/FullAndHybrid groups"
 
             # Total tasks = attention tasks + hybrid tasks (merged into one MultiResult)
             attn_task_num = math.ceil(len(blocks_idx) / per_task_size)
