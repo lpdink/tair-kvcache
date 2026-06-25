@@ -1,8 +1,20 @@
 from enum import Enum
-from typing import Tuple, Dict, Optional, Any
+from typing import Tuple, Dict, Optional, Any, List
 
 import attrs
 import torch
+
+
+@attrs.define(frozen=True)
+class HybridCacheInfo:
+    """Info for non-attention (mamba/gdn/linear) layers in a hybrid model."""
+    layer_names: List[str]
+    # (num_hybrid_layers, ) int64 tensor of base ptrs on GPU
+    ptr_tensor_gpu: torch.Tensor
+    # byte size per block per layer (all hybrid layers share the same page_size_bytes)
+    page_size_bytes: int
+    # number of hybrid layers
+    layer_num: int
 
 
 @attrs.define(frozen=True)
@@ -20,3 +32,5 @@ class KVCacheInfo:
     per_token_per_layer_dim_size: int
     device: torch.device
     dtype: torch.dtype
+    # Hybrid (mamba/gdn/linear) layer info, None for pure attention models
+    hybrid_info: Optional[HybridCacheInfo] = None

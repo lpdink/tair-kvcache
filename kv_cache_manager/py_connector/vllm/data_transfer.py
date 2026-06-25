@@ -290,3 +290,128 @@ class DataTransferManager:
             self._coordinator_client.send(CoordinateMsgSerializer.dumps(msg))
 
         return generate_message
+
+    # ==============================
+    # Hybrid (mamba/gdn/linear) layer transfer methods
+    # ==============================
+
+    def _get_hybrid_block_byte_size(self) -> int:
+        """Total bytes per block across all hybrid layers."""
+        info = self._kvcache_info.hybrid_info
+        return info.page_size_bytes * info.layer_num
+
+    def hybrid_load_task(self, multi_result: MultiResult, task_idx, remote_uris, block_indices):
+        """Load hybrid state for a batch of blocks (opaque byte-level memcpy).
+
+        Args:
+            multi_result: 多任务结果管理器
+            task_idx: 任务索引
+            remote_uris: 远程URI列表 (hybrid spec的URI)
+            block_indices: 每个block的local block id列表
+        """
+        info = self._kvcache_info.hybrid_info
+        per_block_bytes = self._get_hybrid_block_byte_size()
+        device = self._kvcache_info.device
+
+        # Allocate CPU buffer for this batch
+        cpu_buffer = torch.empty(len(remote_uris) * per_block_bytes, dtype=torch.uint8, device="cpu")
+
+        buffers = []
+        for i in range(len(remote_uris)):
+            offset = i * per_block_bytes
+            buf = kvcm_py_client.BlockBuffer()
+            iov = kvcm_py_client.Iov()
+            iov.type = kvcm_py_client.MemoryType.CPU
+            iov.base = cpu_buffer.data_ptr() + offset
+            iov.size = per_block_bytes
+            iov.ignore = False
+            buf.iovs = [iov]
+            buffers.append(buf)
+
+        transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers)
+
+        if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
+            # Scatter from CPU buffer to GPU hybrid state (block-level memcpy)
+            with self._device_mod.stream(self._load_stream):
+                gpu_buffer = cpu_buffer.to(device, non_blocking=True)
+                for i, block_idx in enumerate(block_indices):
+                    for layer_idx in range(info.layer_num):
+                        src_offset = (i * info.layer_num + layer_idx) * info.page_size_bytes
+                        dst_ptr = info.ptr_tensor_gpu[layer_idx].item() + block_idx * info.page_size_bytes
+                        dst_tensor = torch.tensor([], dtype=torch.uint8, device=device).set_(
+                            torch.cuda.UntypedStorage.from_pointer(dst_ptr, info.page_size_bytes, device)
+                        )
+                        dst_tensor.copy_(gpu_buffer[src_offset:src_offset + info.page_size_bytes])
+
+                copy_done_event = self._device_mod.Event()
+                copy_done_event.record(self._load_stream)
+            copy_done_event.synchronize()
+        else:
+            logger.warning("hybrid load task failed, remote_uris:%s, transfer_result:%s",
+                           remote_uris, transfer_result)
+
+        multi_result.submit_result(task_idx, [transfer_result] * len(remote_uris))
+
+    def hybrid_save_task(self, multi_result: MultiResult, task_idx, remote_uris, block_indices,
+                         kvcache_ready_event):
+        """Save hybrid state for a batch of blocks (opaque byte-level memcpy).
+
+        Args:
+            multi_result: 多任务结果管理器
+            task_idx: 任务索引
+            remote_uris: 远程URI列表 (hybrid spec的URI)
+            block_indices: 每个block的local block id列表
+            kvcache_ready_event: KV缓存就绪事件
+        """
+        info = self._kvcache_info.hybrid_info
+        per_block_bytes = self._get_hybrid_block_byte_size()
+        device = self._kvcache_info.device
+
+        # Gather from GPU hybrid state to CPU buffer (block-level memcpy)
+        with self._device_mod.stream(self._save_stream):
+            kvcache_ready_event.wait()
+
+            gpu_buffer = torch.empty(len(block_indices) * per_block_bytes, dtype=torch.uint8, device=device)
+            for i, block_idx in enumerate(block_indices):
+                for layer_idx in range(info.layer_num):
+                    src_ptr = info.ptr_tensor_gpu[layer_idx].item() + block_idx * info.page_size_bytes
+                    src_tensor = torch.tensor([], dtype=torch.uint8, device=device).set_(
+                        torch.cuda.UntypedStorage.from_pointer(src_ptr, info.page_size_bytes, device)
+                    )
+                    dst_offset = (i * info.layer_num + layer_idx) * info.page_size_bytes
+                    gpu_buffer[dst_offset:dst_offset + info.page_size_bytes].copy_(src_tensor)
+
+            copy_done_event = self._device_mod.Event()
+            copy_done_event.record(self._save_stream)
+
+        copy_done_event.synchronize()
+
+        cpu_buffer = gpu_buffer.to("cpu")
+
+        buffers = []
+        for i in range(len(remote_uris)):
+            offset = i * per_block_bytes
+            buf = kvcm_py_client.BlockBuffer()
+            iov = kvcm_py_client.Iov()
+            iov.type = kvcm_py_client.MemoryType.CPU
+            iov.base = cpu_buffer.data_ptr() + offset
+            iov.size = per_block_bytes
+            iov.ignore = False
+            buf.iovs = [iov]
+            buffers.append(buf)
+
+        transfer_result = self._transfer_client.SaveKvCaches(remote_uris, buffers)
+
+        if transfer_result[0] != kvcm_py_client.ClientErrorCode.ER_OK:
+            logger.warning("hybrid save task failed, remote_uris:%s, transfer_result:%s",
+                           remote_uris, transfer_result)
+
+        multi_result.submit_result(task_idx, [transfer_result[0]] * len(remote_uris))
+
+    def create_hybrid_load_done_callback(self, req_id, tp_rank, epoch, local_block_ids):
+        """Create load done callback for hybrid layers (same logic as attention)."""
+        return self.create_load_done_callback(req_id, tp_rank, epoch, local_block_ids)
+
+    def create_hybrid_save_done_callback(self, req_id, tp_rank, write_session_id):
+        """Create save done callback for hybrid layers (same logic as attention)."""
+        return self.create_save_done_callback(req_id, tp_rank, write_session_id)
