@@ -751,6 +751,52 @@ class TestRegisterKvCaches(unittest.TestCase):
             self.assertEqual(conv_state[0, 0].item(), i + 1)
             self.assertEqual(ssm_state[0, 0].item(), i + 100)
 
+    def test_register_kv_caches_full_integration(self):
+        """Full register_kv_caches: mixed dict, verify separation + _hybrid_info."""
+        attn_caches = _make_attn_kv_cache(2, 10, 16, 8, 128, torch.bfloat16)
+        hybrid_caches = _make_hybrid_kv_cache(2, 10, 4096)
+        kv_caches = {**attn_caches, **hybrid_caches}
+
+        c = self._make_connector()
+        c.register_kv_caches(kv_caches)
+
+        # Attention layers registered
+        self.assertEqual(len(c._kvcache_ptr_tensor_cpu), 2)
+        self.assertTrue(torch.all(c._kvcache_ptr_tensor_cpu > 0))
+
+        # Hybrid info built
+        self.assertIsNotNone(c._hybrid_info)
+        self.assertEqual(c._hybrid_info.layer_num, 2)
+        self.assertEqual(len(c._hybrid_info.block_view_tensors), 2)
+        self.assertEqual(c._hybrid_info.page_size_bytes, 4096)
+
+        # Verify block_view_tensors point to hybrid layer storage
+        for i, bvt in enumerate(c._hybrid_info.block_view_tensors):
+            self.assertEqual(bvt.shape[0], 10)  # num_blocks
+
+    def _make_connector(self):
+        """Create minimal connector for register_kv_caches testing."""
+        c = TairKvCacheConnector.__new__(TairKvCacheConnector)
+        c._has_hybrid = True
+        c._tp_size = 1
+        c._local_block_size = 16
+        c._manager_block_size = 16
+        c._device = torch.device("cpu")
+        c._dtype = torch.bfloat16
+        c._use_mla = False
+        c._extra_config = MagicMock()
+        c._extra_config.hf3fs_concurrent_io_block_count = 1
+        c._manager_client = MagicMock()
+        c._manager_client.register_instance.return_value = MagicMock()
+        c._manager_client.register_instance.return_value.storage_configs = []
+        c._transfer_client = MagicMock()
+        c._coordinator_client = MagicMock()
+        c._tp_rank = 0
+        c._location_spec_name = "rank0"
+        c._tp_rank_to_hybrid_spec_name = lambda rank: f"rank{rank}_hybrid"
+        c._hybrid_page_size_bytes = 4096
+        return c
+
 
 # ============================================================================
 # Test: _register_hybrid_kv_caches storage contiguity
@@ -922,6 +968,66 @@ class TestHybridDataRoundTrip(unittest.TestCase):
                 actual = block_views[layer_idx][block_idx]
                 self.assertTrue(torch.equal(actual, expected),
                                 f"Layer {layer_idx}, block {block_idx}: data mismatch")
+
+    def test_load_failure_preserves_data(self):
+        """LoadKvCaches failure: block_view_tensors unchanged, error propagates."""
+        page_size = 128
+        num_blocks = 3
+        block_views = [
+            torch.full((num_blocks, page_size), 42, dtype=torch.uint8),
+            torch.full((num_blocks, page_size), 99, dtype=torch.uint8),
+        ]
+        hybrid_info = HybridCacheInfo(
+            layer_names=["l0.mamba", "l1.mamba"],
+            ptr_tensor_cpu=torch.tensor([bv.data_ptr() for bv in block_views]),
+            block_view_tensors=block_views,
+            page_size_bytes=page_size,
+            layer_num=2,
+        )
+        dt = self._make_data_transfer(hybrid_info)
+
+        # Mock LoadKvCaches to return error
+        dt._transfer_client.LoadKvCaches = lambda uris, buffers: 1  # non-zero = error
+
+        results = []
+        mr = MultiResult(1, lambda r: results.extend(r))
+        dt.hybrid_load_task(mr, 0, ["3fs://fail"], [0])
+
+        # Data unchanged
+        self.assertTrue(torch.all(block_views[0] == 42))
+        self.assertTrue(torch.all(block_views[1] == 99))
+
+        # Error propagated
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0], [1])
+
+    def test_save_failure_propagates(self):
+        """SaveKvCaches failure: error code propagated to multi_result."""
+        page_size = 64
+        block_views = [
+            torch.zeros(2, page_size, dtype=torch.uint8),
+            torch.zeros(2, page_size, dtype=torch.uint8),
+        ]
+        hybrid_info = HybridCacheInfo(
+            layer_names=["l0.mamba"],
+            ptr_tensor_cpu=torch.tensor([block_views[0].data_ptr()]),
+            block_view_tensors=[block_views[0]],
+            page_size_bytes=page_size,
+            layer_num=1,
+        )
+        dt = self._make_data_transfer(hybrid_info)
+
+        # Mock SaveKvCaches to return error
+        dt._transfer_client.SaveKvCaches = lambda uris, buffers: [7]  # error code 7
+
+        results = []
+        mr = MultiResult(1, lambda r: results.extend(r))
+        ready_event = MagicMock()
+        dt.hybrid_save_task(mr, 0, ["3fs://fail0", "3fs://fail1"], [0, 1], ready_event)
+
+        # Error propagated
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0], [7, 7])
 
 
 # ============================================================================
