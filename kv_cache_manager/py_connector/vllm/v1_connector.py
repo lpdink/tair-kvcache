@@ -134,7 +134,12 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             spec = group.kv_cache_spec
             if isinstance(spec, MambaSpec):
                 hybrid_layer_names.extend(group.layer_names)
-                hybrid_page_size_bytes = spec.page_size_bytes
+                if hybrid_page_size_bytes == 0:
+                    hybrid_page_size_bytes = spec.page_size_bytes
+                else:
+                    assert spec.page_size_bytes == hybrid_page_size_bytes, \
+                        f"All MambaSpec groups must have the same page_size_bytes, " \
+                        f"got {spec.page_size_bytes} vs {hybrid_page_size_bytes}"
 
         has_hybrid = len(hybrid_layer_names) > 0
         return has_hybrid, hybrid_layer_names, hybrid_page_size_bytes
@@ -459,7 +464,9 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         if first_attn_kvcache is not None:
             self._register_attention_kv_caches(first_attn_kvcache, attn_layer_names)
         else:
-            raise RuntimeError("No attention layers found in kv_caches")
+            raise RuntimeError(
+                "Pure Mamba/GDN models are not supported; "
+                "at least one Attention layer is required in kv_caches")
 
         # Register hybrid layers if present
         if self._has_hybrid and hybrid_layer_names_in_kv:
@@ -467,6 +474,12 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         elif hybrid_layer_names_in_kv:
             logger.warning("Hybrid layers found in kv_caches but _has_hybrid is False, "
                            "hybrid layers will not be transferred")
+
+        # Safety: if _has_hybrid is True, hybrid_info must have been set
+        if self._has_hybrid:
+            assert getattr(self, '_hybrid_info', None) is not None, \
+                "_has_hybrid is True but hybrid_info was not set; " \
+                "kv_caches may not contain the expected hybrid layers"
 
         # Finalize: build KVCacheInfo and DataTransferManager
         self._finalize_kv_cache_registration()
@@ -540,7 +553,11 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         All state tensors share the same underlying untyped_storage (guaranteed by vllm).
         We reconstruct a (num_blocks, page_size_bytes) byte view for opaque block transfer.
         """
-        # Verify that all hybrid layers share the same storage per layer
+        device = self._device
+        dtype_size = torch.uint8().element_size()
+        block_view_tensors = []
+        ptr_list = []
+
         for name in hybrid_layer_names:
             state_tensors = self._kv_caches[name]
             assert isinstance(state_tensors, list) and len(state_tensors) > 0, \
@@ -552,18 +569,23 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 assert st.untyped_storage().data_ptr() == base_storage.data_ptr(), \
                     f"Hybrid layer {name}: state tensor [{i}] does not share storage with [0]"
 
-        # Build ptr tensor for hybrid layers (one ptr per layer = base of untyped_storage)
-        hybrid_ptrs_cpu = torch.tensor(
-            [self._kv_caches[name][0].untyped_storage().data_ptr()
-             for name in hybrid_layer_names],
-            dtype=torch.int64,
-            device="cpu"
-        )
-        hybrid_ptrs_gpu = hybrid_ptrs_cpu.to(self._device)
+            # Build (num_blocks, page_size_bytes) uint8 view from the shared storage
+            num_blocks = state_tensors[0].shape[0]
+            byte_view = torch.tensor([], dtype=torch.uint8, device=device).set_(base_storage)
+            total_bytes = base_storage.nbytes()
+            assert total_bytes >= num_blocks * self._hybrid_page_size_bytes, \
+                f"Hybrid layer {name}: storage size {total_bytes} < {num_blocks} * {self._hybrid_page_size_bytes}"
+            byte_view = byte_view[:num_blocks * self._hybrid_page_size_bytes].view(
+                num_blocks, self._hybrid_page_size_bytes)
+            block_view_tensors.append(byte_view)
+            ptr_list.append(base_storage.data_ptr())
+
+        ptr_tensor_cpu = torch.tensor(ptr_list, dtype=torch.int64, device="cpu")
 
         self._hybrid_info = HybridCacheInfo(
             layer_names=hybrid_layer_names,
-            ptr_tensor_gpu=hybrid_ptrs_gpu,
+            ptr_tensor_cpu=ptr_tensor_cpu,
+            block_view_tensors=block_view_tensors,
             page_size_bytes=self._hybrid_page_size_bytes,
             layer_num=len(hybrid_layer_names),
         )
@@ -709,7 +731,9 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             done_callback = self._data_transfer.create_save_done_callback(
                 req.req_id,
                 self._kvcache_info.tp_rank,
-                req_save.write_session_id
+                req_save.write_session_id,
+                attn_block_count=len(blocks_idx),
+                hybrid_block_count=len(hybrid_uris)
             )
             multi_result = MultiResult(total_task_num, done_callback)
 
@@ -768,8 +792,10 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         block_indices = []
         for manager_block_idx in manager_block_idxes:
             now_token_idx = manager_block_idx * self._manager_block_size
-            local_block_id = local_block_ids[now_token_idx // self._local_block_size]
-            block_indices.append(local_block_id)
+            local_block_idx = now_token_idx // self._local_block_size
+            assert local_block_idx < len(local_block_ids), \
+                f"block index {local_block_idx} out of range (len={len(local_block_ids)})"
+            block_indices.append(local_block_ids[local_block_idx])
         return block_indices
 
     def get_finished(

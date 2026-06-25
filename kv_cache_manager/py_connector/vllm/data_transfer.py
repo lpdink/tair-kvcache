@@ -257,29 +257,38 @@ class DataTransferManager:
         # TODO: submit uri when enable local alloc
         multi_result.submit_result(task_idx, [transfer_result[0]] * len(remote_uris))
 
-    def create_save_done_callback(self, req_id, tp_rank, write_session_id):
+    def create_save_done_callback(self, req_id, tp_rank, write_session_id,
+                                  attn_block_count=0, hybrid_block_count=0):
         """创建保存完成回调函数
         
         Args:
             req_id: 请求ID
             tp_rank: TP rank
             write_session_id: 写入会话ID
+            attn_block_count: attention层的block数量（用于AND-merge hybrid结果）
+            hybrid_block_count: hybrid层的block数量（0表示纯attention模型）
             
         Returns:
             回调函数
         """
         def generate_message(task_results):
-            is_successes = []
-            # TODO: report uri when enable local alloc
-            # remote_uris = []
+            # Flatten all task results into a single list
+            all_successes = []
             for task_result in task_results:
                 for block_result in task_result:
-                    if block_result != kvcm_py_client.ClientErrorCode.ER_OK:
-                        is_successes.append(False)
-                        # remote_uris.append(None)
-                    else:
-                        is_successes.append(True)
-                        # remote_uris.extend(future_result[1])
+                    all_successes.append(block_result == kvcm_py_client.ClientErrorCode.ER_OK)
+
+            if hybrid_block_count > 0 and attn_block_count > 0:
+                # AND-merge: attention[i] AND hybrid[i] → block i is fully saved
+                attn_successes = all_successes[:attn_block_count]
+                hybrid_successes = all_successes[attn_block_count:]
+                is_successes = [
+                    attn_successes[i] and hybrid_successes[i]
+                    for i in range(attn_block_count)
+                ]
+            else:
+                # Pure attention (or pure hybrid) — no merge needed
+                is_successes = all_successes
 
             msg = CoordinateMessage(
                 time.time(),
@@ -313,8 +322,9 @@ class DataTransferManager:
         per_block_bytes = self._get_hybrid_block_byte_size()
         device = self._kvcache_info.device
 
-        # Allocate CPU buffer for this batch
-        cpu_buffer = torch.empty(len(remote_uris) * per_block_bytes, dtype=torch.uint8, device="cpu")
+        # Allocate pinned CPU buffer for this batch (faster GPU↔CPU transfer)
+        cpu_buffer = torch.empty(len(remote_uris) * per_block_bytes, dtype=torch.uint8,
+                                 device="cpu", pin_memory=True)
 
         buffers = []
         for i in range(len(remote_uris)):
@@ -331,17 +341,14 @@ class DataTransferManager:
         transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers)
 
         if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
-            # Scatter from CPU buffer to GPU hybrid state (block-level memcpy)
+            # Scatter from CPU buffer to GPU hybrid state (block-level memcpy via tensor indexing)
             with self._device_mod.stream(self._load_stream):
                 gpu_buffer = cpu_buffer.to(device, non_blocking=True)
                 for i, block_idx in enumerate(block_indices):
                     for layer_idx in range(info.layer_num):
                         src_offset = (i * info.layer_num + layer_idx) * info.page_size_bytes
-                        dst_ptr = info.ptr_tensor_gpu[layer_idx].item() + block_idx * info.page_size_bytes
-                        dst_tensor = torch.tensor([], dtype=torch.uint8, device=device).set_(
-                            torch.cuda.UntypedStorage.from_pointer(dst_ptr, info.page_size_bytes, device)
-                        )
-                        dst_tensor.copy_(gpu_buffer[src_offset:src_offset + info.page_size_bytes])
+                        src_slice = gpu_buffer[src_offset:src_offset + info.page_size_bytes]
+                        info.block_view_tensors[layer_idx][block_idx].copy_(src_slice)
 
                 copy_done_event = self._device_mod.Event()
                 copy_done_event.record(self._load_stream)
@@ -367,19 +374,16 @@ class DataTransferManager:
         per_block_bytes = self._get_hybrid_block_byte_size()
         device = self._kvcache_info.device
 
-        # Gather from GPU hybrid state to CPU buffer (block-level memcpy)
+        # Gather from GPU hybrid state to GPU buffer (block-level memcpy via tensor indexing)
         with self._device_mod.stream(self._save_stream):
             kvcache_ready_event.wait()
 
             gpu_buffer = torch.empty(len(block_indices) * per_block_bytes, dtype=torch.uint8, device=device)
             for i, block_idx in enumerate(block_indices):
                 for layer_idx in range(info.layer_num):
-                    src_ptr = info.ptr_tensor_gpu[layer_idx].item() + block_idx * info.page_size_bytes
-                    src_tensor = torch.tensor([], dtype=torch.uint8, device=device).set_(
-                        torch.cuda.UntypedStorage.from_pointer(src_ptr, info.page_size_bytes, device)
-                    )
+                    src_slice = info.block_view_tensors[layer_idx][block_idx]
                     dst_offset = (i * info.layer_num + layer_idx) * info.page_size_bytes
-                    gpu_buffer[dst_offset:dst_offset + info.page_size_bytes].copy_(src_tensor)
+                    gpu_buffer[dst_offset:dst_offset + info.page_size_bytes].copy_(src_slice)
 
             copy_done_event = self._device_mod.Event()
             copy_done_event.record(self._save_stream)
@@ -407,11 +411,3 @@ class DataTransferManager:
                            remote_uris, transfer_result)
 
         multi_result.submit_result(task_idx, [transfer_result[0]] * len(remote_uris))
-
-    def create_hybrid_load_done_callback(self, req_id, tp_rank, epoch, local_block_ids):
-        """Create load done callback for hybrid layers (same logic as attention)."""
-        return self.create_load_done_callback(req_id, tp_rank, epoch, local_block_ids)
-
-    def create_hybrid_save_done_callback(self, req_id, tp_rank, write_session_id):
-        """Create save done callback for hybrid layers (same logic as attention)."""
-        return self.create_save_done_callback(req_id, tp_rank, write_session_id)
