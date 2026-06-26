@@ -126,6 +126,9 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         We delegate to request_finished which handles saving progress tracking.
         """
+        if not block_ids:
+            logger.warning("request_finished_all_groups: empty block_ids for %s", request.request_id)
+            return self.request_finished(request, [])
         # For hybrid models with mamba_cache_mode="all", all groups share block_ids.
         # We use block_ids[0] (attention group) since the saving logic is block-level.
         delay_free, extra_info = self.request_finished(request, block_ids[0])
@@ -380,8 +383,30 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             assert self._transfer_client is not None, "kvcm_py_client.TransferClient.Create failed"
 
     def shutdown(self):
-        # TODO: stop background threads and cleanup transfer client
-        self._manager_client.close()
+        """Clean up all resources.
+
+        Shuts down thread pools and closes clients to prevent resource leaks
+        when the process exits.
+        """
+        logger.info("TairKvCacheConnector shutting down")
+        # Shutdown IO executor (save/load tasks)
+        if hasattr(self, '_data_transfer') and self._data_transfer is not None:
+            try:
+                self._data_transfer._io_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as e:
+                logger.warning("Failed to shutdown IO executor: %s", e)
+        # Shutdown HTTP executor (location queries)
+        if hasattr(self, '_http_executor') and self._http_executor is not None:
+            try:
+                self._http_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as e:
+                logger.warning("Failed to shutdown HTTP executor: %s", e)
+        # Close manager client
+        if hasattr(self, '_manager_client') and self._manager_client is not None:
+            try:
+                self._manager_client.close()
+            except Exception as e:
+                logger.warning("Failed to close manager client: %s", e)
         return None
 
     def parse_hf3fs_configs(self, storage_configs):
@@ -785,13 +810,31 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         pass
 
     def wait_for_save(self):
+        """Wait for all save operations to complete.
+
+        CRITICAL: This method must ensure all GPU gather operations finish before
+        returning. The contract is: after wait_for_save() returns, vLLM may
+        overwrite the KV cache blocks that were just saved.
+
+        Why: Unlike NIXL/Mooncake (P/D separation where blocks aren't overwritten),
+        our connector runs on the same instance that does forward + save. So the next
+        step's forward (on default stream) could overwrite blocks while save_stream
+        is still gathering them. We must block until all gathers complete.
+
+        Implementation: Each save_task internally calls copy_done_event.synchronize()
+        which blocks until GPU gather finishes. So future.result() guarantees gather
+        completion.
+        """
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
         # logger.warning("wait_for_save, meta: %r", meta)
 
-        kvcache_ready_event = None
-        if len(meta.to_save_requests) > 0:
-            kvcache_ready_event = self._device_mod.Event()
-            kvcache_ready_event.record(self._device_mod.current_stream())
+        if len(meta.to_save_requests) == 0:
+            return
+
+        kvcache_ready_event = self._device_mod.Event()
+        kvcache_ready_event.record(self._device_mod.current_stream())
+
+        all_futures = []
 
         for req_save in meta.to_save_requests:
             req = self._alive_requests[req_save.req_id]
@@ -835,9 +878,10 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 end_idx = min(len(blocks_idx), i + per_task_size)
                 task_remote_uris = all_remote_uris[i:end_idx]
                 task_block_token_indices = blocks_idx[i:end_idx]
-                self._data_transfer.submit_task(self._data_transfer.save_task, multi_result, task_idx, task_remote_uris,
-                                                task_block_token_indices,
-                                                kvcache_ready_event)
+                future = self._data_transfer.submit_task(
+                    self._data_transfer.save_task, multi_result, task_idx, task_remote_uris,
+                    task_block_token_indices, kvcache_ready_event)
+                all_futures.append(future)
                 task_idx += 1
 
             # Submit hybrid tasks (continuing with same multi_result)
@@ -845,14 +889,26 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 end_idx = min(len(hybrid_uris), i + per_task_size)
                 h_task_uris = hybrid_uris[i:end_idx]
                 h_task_blocks = hybrid_block_indices[i:end_idx]
-                self._data_transfer.submit_task(
+                future = self._data_transfer.submit_task(
                     self._data_transfer.hybrid_save_task,
                     multi_result, task_idx, h_task_uris, h_task_blocks,
                     kvcache_ready_event)
+                all_futures.append(future)
                 task_idx += 1
 
             if self._tp_rank == 0:
                 req.scheduled_saving_count += 1
+
+        # Wait for all save tasks to complete (GPU gather + CPU transfer).
+        # save_task internally synchronizes copy_done_event before returning,
+        # so future.result() guarantees the GPU gather has finished reading
+        # from the KV cache blocks. After this point, blocks can be safely
+        # overwritten by the next step's forward pass.
+        for future in all_futures:
+            try:
+                future.result()
+            except Exception as e:
+                logger.warning("save_task failed: %s", e)
 
     def get_self_uris(self, locations):
         all_remote_uris = []

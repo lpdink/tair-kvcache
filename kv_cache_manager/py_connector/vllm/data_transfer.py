@@ -102,16 +102,15 @@ class DataTransferManager:
         (via _update_hybrid_attention_mamba_layout). The Triton kernel requires
         contiguous tensors, so we copy from strided to contiguous here.
         
-        This method is protected by _sync_lock to prevent concurrent save_task
-        threads from racing on the same contiguous buffers.
+        NOTE: Caller must hold _sync_lock to prevent concurrent save_task threads
+        from racing on the same contiguous buffers.
         """
         if not self._kvcache_info.has_strided_attn:
             return
-        with self._sync_lock:
-            strided = self._kvcache_info.attn_strided_tensors
-            contiguous = self._kvcache_info.attn_contiguous_buffers
-            for name in strided:
-                contiguous[name].copy_(strided[name])
+        strided = self._kvcache_info.attn_strided_tensors
+        contiguous = self._kvcache_info.attn_contiguous_buffers
+        for name in strided:
+            contiguous[name].copy_(strided[name])
 
     def _post_scatter_sync(self):
         """Sync contiguous buffers → strided attention tensors after Triton scatter.
@@ -119,16 +118,15 @@ class DataTransferManager:
         After the Triton kernel writes loaded KV data into the contiguous buffers,
         we copy back to the original strided tensors that vLLM uses for attention.
         
-        This method is protected by _sync_lock to prevent concurrent load_task
-        threads from racing on the same contiguous buffers.
+        NOTE: Caller must hold _sync_lock to prevent concurrent load_task threads
+        from racing on the same contiguous buffers.
         """
         if not self._kvcache_info.has_strided_attn:
             return
-        with self._sync_lock:
-            strided = self._kvcache_info.attn_strided_tensors
-            contiguous = self._kvcache_info.attn_contiguous_buffers
-            for name in strided:
-                strided[name].copy_(contiguous[name])
+        strided = self._kvcache_info.attn_strided_tensors
+        contiguous = self._kvcache_info.attn_contiguous_buffers
+        for name in strided:
+            strided[name].copy_(contiguous[name])
     
     def _create_io_executor(self) -> ThreadPoolExecutor:
         """创建IO线程池执行器"""
@@ -189,19 +187,23 @@ class DataTransferManager:
         logger.debug("done transfer,result:%s", transfer_result)
         if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
             with self._device_mod.stream(self._load_stream):
-                batch_gather_scatter_helper.batch_scatter_kv_caches(
-                    self._kvcache_info.all_kvcache_ptr_tensor_gpu,
-                    self._copy_buffer_allocator._raw_buffer,
-                    block_token_indices,
-                    copy_buffer_indices,
-                    self._manager_block_size,
-                    self._kvcache_info.per_token_per_layer_dim_size,
-                )
-                # Sync contiguous → strided for hybrid models (after Triton scatter)
-                self._post_scatter_sync()
+                # Lock protects both Triton scatter AND post_scatter_sync to prevent
+                # concurrent load_tasks from racing on contiguous buffers.
+                # Race: Task A scatter → Task B scatter (overwrites contiguous) → Task A copy (gets B's data)
+                with self._sync_lock:
+                    batch_gather_scatter_helper.batch_scatter_kv_caches(
+                        self._kvcache_info.all_kvcache_ptr_tensor_gpu,
+                        self._copy_buffer_allocator._raw_buffer,
+                        block_token_indices,
+                        copy_buffer_indices,
+                        self._manager_block_size,
+                        self._kvcache_info.per_token_per_layer_dim_size,
+                    )
+                    # Sync contiguous → strided for hybrid models (after Triton scatter)
+                    self._post_scatter_sync()
 
-                copy_done_event = self._device_mod.Event()
-                copy_done_event.record(self._load_stream)
+                    copy_done_event = self._device_mod.Event()
+                    copy_done_event.record(self._load_stream)
             copy_done_event.synchronize()
 
             logger.debug("done scatter")
@@ -272,19 +274,23 @@ class DataTransferManager:
 
         with self._device_mod.stream(self._save_stream):
             kvcache_ready_event.wait()
-            # Sync strided → contiguous for hybrid models (before Triton gather)
-            self._pre_gather_sync()
-            copy_buffer_indices = self._copy_buffer_allocator.alloc_buffer_idx_blocking(len(remote_uris))
-            batch_gather_scatter_helper.batch_gather_kv_caches(
-                self._kvcache_info.all_kvcache_ptr_tensor_gpu,
-                self._copy_buffer_allocator._raw_buffer,
-                block_token_indices,
-                copy_buffer_indices,
-                self._manager_block_size,
-                self._kvcache_info.per_token_per_layer_dim_size,
-            )
-            copy_done_event = self._device_mod.Event()
-            copy_done_event.record(self._save_stream)
+            # Lock protects both _pre_gather_sync AND Triton gather to prevent
+            # concurrent save_tasks from racing on contiguous buffers.
+            # Race: Task A copy → Task B copy (overwrites contiguous) → Task A gather (gets B's data)
+            with self._sync_lock:
+                # Sync strided → contiguous for hybrid models (before Triton gather)
+                self._pre_gather_sync()
+                copy_buffer_indices = self._copy_buffer_allocator.alloc_buffer_idx_blocking(len(remote_uris))
+                batch_gather_scatter_helper.batch_gather_kv_caches(
+                    self._kvcache_info.all_kvcache_ptr_tensor_gpu,
+                    self._copy_buffer_allocator._raw_buffer,
+                    block_token_indices,
+                    copy_buffer_indices,
+                    self._manager_block_size,
+                    self._kvcache_info.per_token_per_layer_dim_size,
+                )
+                copy_done_event = self._device_mod.Event()
+                copy_done_event.record(self._save_stream)
 
         copy_done_event.synchronize()
 
