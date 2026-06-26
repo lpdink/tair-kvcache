@@ -90,6 +90,10 @@ class DataTransferManager:
         # 保存和加载流
         self._save_stream = self._device_mod.Stream()
         self._load_stream = self._device_mod.Stream()
+        
+        # 锁：保护 _pre_gather_sync 和 _post_scatter_sync，防止多个 save_task/load_task
+        # 并发执行时对同一组 contiguous buffers 的 copy_() 操作产生竞争
+        self._sync_lock = threading.Lock()
 
     def _pre_gather_sync(self):
         """Sync strided attention tensors → contiguous buffers before Triton gather.
@@ -97,26 +101,34 @@ class DataTransferManager:
         For hybrid models, vLLM creates strided views of the attention KV cache
         (via _update_hybrid_attention_mamba_layout). The Triton kernel requires
         contiguous tensors, so we copy from strided to contiguous here.
+        
+        This method is protected by _sync_lock to prevent concurrent save_task
+        threads from racing on the same contiguous buffers.
         """
         if not self._kvcache_info.has_strided_attn:
             return
-        strided = self._kvcache_info.attn_strided_tensors
-        contiguous = self._kvcache_info.attn_contiguous_buffers
-        for name in strided:
-            contiguous[name].copy_(strided[name])
+        with self._sync_lock:
+            strided = self._kvcache_info.attn_strided_tensors
+            contiguous = self._kvcache_info.attn_contiguous_buffers
+            for name in strided:
+                contiguous[name].copy_(strided[name])
 
     def _post_scatter_sync(self):
         """Sync contiguous buffers → strided attention tensors after Triton scatter.
 
         After the Triton kernel writes loaded KV data into the contiguous buffers,
         we copy back to the original strided tensors that vLLM uses for attention.
+        
+        This method is protected by _sync_lock to prevent concurrent load_task
+        threads from racing on the same contiguous buffers.
         """
         if not self._kvcache_info.has_strided_attn:
             return
-        strided = self._kvcache_info.attn_strided_tensors
-        contiguous = self._kvcache_info.attn_contiguous_buffers
-        for name in strided:
-            strided[name].copy_(contiguous[name])
+        with self._sync_lock:
+            strided = self._kvcache_info.attn_strided_tensors
+            contiguous = self._kvcache_info.attn_contiguous_buffers
+            for name in strided:
+                strided[name].copy_(contiguous[name])
     
     def _create_io_executor(self) -> ThreadPoolExecutor:
         """创建IO线程池执行器"""

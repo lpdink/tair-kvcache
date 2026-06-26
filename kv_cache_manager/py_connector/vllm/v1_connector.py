@@ -119,12 +119,17 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         """
         Called when a request has finished all kv cache groups.
-        
-        For TairKvCacheConnector, we don't manage block lifecycle asynchronously,
-        so we return False to let vLLM handle block freeing normally.
+
+        For hybrid models, block_ids is a tuple where each element corresponds
+        to a kv_cache_group (e.g. block_ids[0] = attention blocks, block_ids[1] = hybrid blocks).
+        In mamba_cache_mode="all", all groups share the same block_ids.
+
+        We delegate to request_finished which handles saving progress tracking.
         """
-        # Return (False, None) to indicate we don't take over block management
-        return False, None
+        # For hybrid models with mamba_cache_mode="all", all groups share block_ids.
+        # We use block_ids[0] (attention group) since the saving logic is block-level.
+        delay_free, extra_info = self.request_finished(request, block_ids[0])
+        return delay_free, extra_info
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
