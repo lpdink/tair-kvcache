@@ -743,6 +743,9 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
 
+        # Collect all load futures to wait for them later
+        self._load_futures = []
+
         for load_req in meta.to_load_requests:
             if len(load_req.need_load_locations) == 0:
                 continue
@@ -786,8 +789,9 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 end_idx = min(len(block_token_indices), i + per_task_size)
                 task_remote_uris = all_remote_uris[i:end_idx]
                 task_block_token_indices = block_token_indices[i:end_idx]
-                self._data_transfer.submit_task(self._data_transfer.load_task, multi_result, task_idx, task_remote_uris,
+                future = self._data_transfer.submit_task(self._data_transfer.load_task, multi_result, task_idx, task_remote_uris,
                                                 task_block_token_indices)
+                self._load_futures.append(future)
                 task_idx += 1
 
             # Submit hybrid tasks (continuing with same multi_result)
@@ -795,14 +799,49 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 end_idx = min(len(hybrid_uris), i + per_task_size)
                 h_task_uris = hybrid_uris[i:end_idx]
                 h_task_blocks = hybrid_block_indices[i:end_idx]
-                self._data_transfer.submit_task(
+                future = self._data_transfer.submit_task(
                     self._data_transfer.hybrid_load_task,
                     multi_result, task_idx, h_task_uris, h_task_blocks)
+                self._load_futures.append(future)
                 task_idx += 1
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # logger.warning("wait_for_layer_load, layer_name: %s", layer_name)
-        pass
+        """Wait for all load operations to complete.
+
+        CRITICAL: This method must ensure all GPU scatter operations finish before
+        returning. The contract is: after wait_for_layer_load() returns, the forward
+        pass can safely read the loaded KV cache data.
+
+        Why: Unlike NIXL/Mooncake (P/D separation), our connector loads KV cache
+        on the same instance that does forward. The forward pass (on default stream)
+        could read KV cache blocks while load_stream is still scattering data into them.
+        We must block until all scatters complete.
+
+        Implementation: Each load_task internally calls copy_done_event.synchronize()
+        which blocks until GPU scatter finishes. So future.result() guarantees scatter
+        completion. We only wait on the first layer to avoid redundant waits.
+        """
+        # Only wait on the first layer call to avoid redundant waits
+        if not hasattr(self, '_load_futures_waited'):
+            self._load_futures_waited = set()
+        
+        if layer_name in self._load_futures_waited:
+            return
+        
+        self._load_futures_waited.add(layer_name)
+        
+        # Only wait once per forward pass (on first layer)
+        if hasattr(self, '_load_futures') and len(self._load_futures_waited) == 1:
+            for future in self._load_futures:
+                try:
+                    future.result(timeout=self._extra_config.read_timeout_seconds * 2)
+                except TimeoutError:
+                    logger.error("load_task timed out")
+                    future.cancel()
+                except Exception as e:
+                    logger.warning("load_task failed: %s", e)
+            # Clear futures after waiting
+            self._load_futures = []
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata",
                       **kwargs) -> None:

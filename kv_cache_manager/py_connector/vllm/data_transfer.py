@@ -87,12 +87,13 @@ class DataTransferManager:
         # 创建内部线程池执行器
         self._io_executor = self._create_io_executor()
         
-        # 保存和加载流
-        self._save_stream = self._device_mod.Stream()
-        self._load_stream = self._device_mod.Stream()
+        # 统一的传输流（save 和 load 共用）
+        # 单 stream 保证 FIFO 执行顺序，避免跨流竞争导致的数据损坏
+        # _sync_lock 保证 CPU 侧原子入队，GPU 侧由 stream FIFO 保证顺序
+        self._transfer_stream = self._device_mod.Stream()
         
-        # 锁：保护 _pre_gather_sync 和 _post_scatter_sync，防止多个 save_task/load_task
-        # 并发执行时对同一组 contiguous buffers 的 copy_() 操作产生竞争
+        # 锁：保护 contiguous buffer 的 CPU 侧操作（copy_ 入队 + gather/scatter 入队）
+        # 防止多个 save_task/load_task 并发时对同一组 contiguous buffers 产生竞争
         self._sync_lock = threading.Lock()
 
     def _pre_gather_sync(self):
@@ -186,7 +187,7 @@ class DataTransferManager:
         transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers)
         logger.debug("done transfer,result:%s", transfer_result)
         if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
-            with self._device_mod.stream(self._load_stream):
+            with self._device_mod.stream(self._transfer_stream):
                 # Lock protects both Triton scatter AND post_scatter_sync to prevent
                 # concurrent load_tasks from racing on contiguous buffers.
                 # Race: Task A scatter → Task B scatter (overwrites contiguous) → Task A copy (gets B's data)
@@ -203,7 +204,7 @@ class DataTransferManager:
                     self._post_scatter_sync()
 
                     copy_done_event = self._device_mod.Event()
-                    copy_done_event.record(self._load_stream)
+                    copy_done_event.record(self._transfer_stream)
             copy_done_event.synchronize()
 
             logger.debug("done scatter")
@@ -272,7 +273,7 @@ class DataTransferManager:
         """
         logger.debug("save remote_uris:%s, block_token_indices:%s", remote_uris, block_token_indices)
 
-        with self._device_mod.stream(self._save_stream):
+        with self._device_mod.stream(self._transfer_stream):
             kvcache_ready_event.wait()
             # Lock protects both _pre_gather_sync AND Triton gather to prevent
             # concurrent save_tasks from racing on contiguous buffers.
@@ -290,7 +291,7 @@ class DataTransferManager:
                     self._kvcache_info.per_token_per_layer_dim_size,
                 )
                 copy_done_event = self._device_mod.Event()
-                copy_done_event.record(self._save_stream)
+                copy_done_event.record(self._transfer_stream)
 
         copy_done_event.synchronize()
 
