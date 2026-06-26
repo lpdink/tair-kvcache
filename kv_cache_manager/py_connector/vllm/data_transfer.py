@@ -90,6 +90,33 @@ class DataTransferManager:
         # 保存和加载流
         self._save_stream = self._device_mod.Stream()
         self._load_stream = self._device_mod.Stream()
+
+    def _pre_gather_sync(self):
+        """Sync strided attention tensors → contiguous buffers before Triton gather.
+
+        For hybrid models, vLLM creates strided views of the attention KV cache
+        (via _update_hybrid_attention_mamba_layout). The Triton kernel requires
+        contiguous tensors, so we copy from strided to contiguous here.
+        """
+        if not self._kvcache_info.has_strided_attn:
+            return
+        strided = self._kvcache_info.attn_strided_tensors
+        contiguous = self._kvcache_info.attn_contiguous_buffers
+        for name in strided:
+            contiguous[name].copy_(strided[name])
+
+    def _post_scatter_sync(self):
+        """Sync contiguous buffers → strided attention tensors after Triton scatter.
+
+        After the Triton kernel writes loaded KV data into the contiguous buffers,
+        we copy back to the original strided tensors that vLLM uses for attention.
+        """
+        if not self._kvcache_info.has_strided_attn:
+            return
+        strided = self._kvcache_info.attn_strided_tensors
+        contiguous = self._kvcache_info.attn_contiguous_buffers
+        for name in strided:
+            strided[name].copy_(contiguous[name])
     
     def _create_io_executor(self) -> ThreadPoolExecutor:
         """创建IO线程池执行器"""
@@ -158,6 +185,8 @@ class DataTransferManager:
                     self._manager_block_size,
                     self._kvcache_info.per_token_per_layer_dim_size,
                 )
+                # Sync contiguous → strided for hybrid models (after Triton scatter)
+                self._post_scatter_sync()
 
                 copy_done_event = self._device_mod.Event()
                 copy_done_event.record(self._load_stream)
@@ -231,6 +260,8 @@ class DataTransferManager:
 
         with self._device_mod.stream(self._save_stream):
             kvcache_ready_event.wait()
+            # Sync strided → contiguous for hybrid models (before Triton gather)
+            self._pre_gather_sync()
             copy_buffer_indices = self._copy_buffer_allocator.alloc_buffer_idx_blocking(len(remote_uris))
             batch_gather_scatter_helper.batch_gather_kv_caches(
                 self._kvcache_info.all_kvcache_ptr_tensor_gpu,

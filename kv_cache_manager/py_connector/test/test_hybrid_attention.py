@@ -38,11 +38,16 @@ class _KVConnectorMetadata:
     pass
 class _KVConnectorBase_V1:
     pass
+class _SupportsHMA:
+    """Mock SupportsHMA mixin (ABC for hybrid memory allocator support)."""
+    def request_finished_all_groups(self, request, block_ids):
+        return False, None
 class _KVConnectorRole:
     SCHEDULER = "scheduler"
     WORKER = "worker"
 _base_mock.KVConnectorMetadata = _KVConnectorMetadata
 _base_mock.KVConnectorBase_V1 = _KVConnectorBase_V1
+_base_mock.SupportsHMA = _SupportsHMA
 _base_mock.KVConnectorRole = _KVConnectorRole
 sys.modules['vllm.distributed.kv_transfer.kv_connector.v1.base'] = _base_mock
 
@@ -152,13 +157,17 @@ def _make_kv_cache_config(attn_layer_names, hybrid_layer_names, page_size_bytes=
 
 
 def _make_attn_kv_cache(num_layers, num_blocks, block_size, kv_heads, head_size, dtype):
-    """Create attention KV cache tensors (simulating vllm's layout)."""
+    """Create attention KV cache tensors (simulating vllm's layout).
+    
+    vLLM FlashAttention creates: (num_blocks, 2, block_size, kv_heads, head_size)
+    See: vllm/v1/attention/backends/flash_attn.py::get_kv_cache_shape
+    """
     kv_caches = {}
     for i in range(num_layers):
         name = f"model.layers.{i}.self_attn"
-        # Shape: (2, num_blocks, block_size, kv_heads, head_size)
+        # Shape: (num_blocks, 2, block_size, kv_heads, head_size)
         kv_caches[name] = torch.randn(
-            2, num_blocks, block_size, kv_heads, head_size,
+            num_blocks, 2, block_size, kv_heads, head_size,
             dtype=dtype, device="cpu"
         )
     return kv_caches

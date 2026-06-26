@@ -37,3 +37,11 @@ class KVCacheInfo:
     dtype: torch.dtype
     # Hybrid (mamba/gdn/linear) layer info, None for pure attention models
     hybrid_info: Optional[HybridCacheInfo] = None
+    # Strided attention tensor support (for hybrid models with HMA).
+    # When vLLM's _update_hybrid_attention_mamba_layout() modifies tensor strides,
+    # the attention KV cache becomes non-contiguous. We maintain separate contiguous
+    # buffers for the Triton kernel and sync them before save / after load.
+    # None for pure attention models (tensors are already contiguous).
+    attn_contiguous_buffers: Optional[Dict[str, torch.Tensor]] = None
+    attn_strided_tensors: Optional[Dict[str, torch.Tensor]] = None
+    has_strided_attn: bool = False

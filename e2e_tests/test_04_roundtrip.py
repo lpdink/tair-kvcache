@@ -89,13 +89,15 @@ def test_save_load_roundtrip() -> bool:
         print(f"  First:  {tokens1}")
         print(f"  Second: {tokens2}")
     
-    # For temperature=0.0, we expect exact match
+    # For temperature=0.0, we expect exact match — output difference is a bug
     if text1 == text2 and tokens1 == tokens2:
         print("✓ Round-trip verification passed")
         return True
     else:
-        print("⚠ Round-trip verification: outputs differ (may be expected depending on cache behavior)")
-        return True  # Not a hard failure
+        print("✗ Round-trip verification FAILED: outputs differ with temperature=0.0")
+        print(f"  First text:  {text1!r}")
+        print(f"  Second text: {text2!r}")
+        return False
 
 
 if __name__ == "__main__":

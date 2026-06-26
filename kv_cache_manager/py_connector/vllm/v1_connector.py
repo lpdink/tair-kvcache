@@ -127,14 +127,13 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         return False, None
 
     @classmethod
-    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str:
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
         """
-        Specify the required KV cache layout for this connector.
-        
-        TairKvCacheConnector expects HND (Head, seq_len, head_Dim) layout
-        for attention layers to match the existing tensor indexing code.
+        We don't enforce a specific KV cache layout. vLLM will use the default
+        layout determined by the attention backend (typically NHD for FlashAttention).
+        Our sync-buffer approach handles both contiguous and strided tensors correctly.
         """
-        return "HND"
+        return None
 
     def _tp_rank_to_spec_name(self, tp_rank: int) -> str:
         """Convert TP rank to location spec name."""
@@ -191,6 +190,8 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         configure_log_level(self._extra_config.log_level)
 
         self._kv_caches: Optional[dict[str, torch.Tensor]] = None
+        self._attn_strided_tensors: Optional[dict[str, torch.Tensor]] = None
+        self._attn_contiguous_buffers: Optional[dict[str, torch.Tensor]] = None
         self._local_block_size = vllm_config.cache_config.block_size
 
         model_config = vllm_config.model_config
@@ -510,128 +511,117 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._finalize_kv_cache_registration()
 
     def _register_attention_kv_caches(self, first_layer_kvcache, attn_layer_names):
-        """Register attention layer KV caches (existing logic)."""
+        """Register attention layer KV caches.
+
+        Handles both contiguous tensors (pure attention models) and strided tensors
+        (hybrid models where vLLM's _update_hybrid_attention_mamba_layout modifies strides).
+
+        For strided tensors, we maintain separate contiguous buffers for the Triton kernel
+        and sync them before save / after load via DataTransferManager.
+        Reference: NIXL/Mooncake connectors use stride(0) for block addressing;
+        we adopt a similar approach with sync buffers for kernel compatibility.
+        """
         # TODO: support MLA
 
-        # Debug: print actual layout
-        try:
-            from vllm.distributed.kv_transfer.kv_connector.utils import get_kv_connector_cache_layout
-            layout = get_kv_connector_cache_layout()
-            logger.info(f"[DEBUG] KV cache layout from vLLM: {layout}")
-        except Exception as e:
-            logger.warning(f"[DEBUG] Failed to get KV cache layout: {e}")
+        # ── Detect strided tensors (hybrid models with HMA) ──
+        has_strided = any(
+            not self._kv_caches[name].is_contiguous() for name in attn_layer_names
+        )
 
-        logger.info(f"[DEBUG] _register_attention_kv_caches: "
-                   f"_local_block_size={self._local_block_size}, "
-                   f"kv_cache_shape={first_layer_kvcache.shape}, "
-                   f"vllm_config.cache_config.block_size={self._vllm_config.cache_config.block_size}")
-        
-        # For hybrid models, the config block_size may differ from the actual tensor block_size
-        # Use the actual tensor block_size for internal operations
-        # NHD layout: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-        # HND layout: [num_blocks, 2, num_kv_heads, block_size, head_dim]
-        # For now, assume NHD layout (block_size at index 2)
-        self._local_block_size = first_layer_kvcache.shape[2]
-        logger.info(f"[DEBUG] Updated _local_block_size to {self._local_block_size} from tensor shape")
-        
-        # Detect actual layout from strides
-        # For NHD: stride[2] should be num_kv_heads * head_dim
-        # For HND: stride[2] should be head_dim
-        expected_nhd_stride = first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]
-        actual_stride_dim2 = first_layer_kvcache.stride()[2]
-        
-        if actual_stride_dim2 == first_layer_kvcache.shape[4]:
-            # HND layout: [num_blocks, 2, num_kv_heads, block_size, head_dim]
-            self._kv_cache_layout = "HND"
-            logger.info(f"[DEBUG] Detected HND layout from strides")
+        if has_strided:
+            # Store original strided tensors and create contiguous copies for Triton kernel.
+            # The contiguous copies are synced before save / after load in DataTransferManager.
+            self._attn_strided_tensors = {name: self._kv_caches[name] for name in attn_layer_names}
+            self._attn_contiguous_buffers = {
+                name: self._kv_caches[name].contiguous() for name in attn_layer_names
+            }
+            logger.info("Hybrid model: %d attention layers have strided layout, "
+                       "using sync-buffer approach for Triton kernel compatibility",
+                       len(attn_layer_names))
+            # Use contiguous buffers for pointer computation below
+            working_caches = self._attn_contiguous_buffers
+            first_cache = self._attn_contiguous_buffers[attn_layer_names[0]]
         else:
-            # NHD layout: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-            self._kv_cache_layout = "NHD"
-            logger.info(f"[DEBUG] Detected NHD layout from strides")
-        
-        for name in attn_layer_names:
-            kvcache = self._kv_caches[name]
-            # For hybrid models with HMA, tensors may not be contiguous
-            # We'll handle this by making them contiguous if needed
-            if not kvcache.is_contiguous():
-                logger.warning(f"KV cache for {name} is not contiguous, making it contiguous")
-                self._kv_caches[name] = kvcache.contiguous()
-                kvcache = self._kv_caches[name]
+            self._attn_strided_tensors = None
+            self._attn_contiguous_buffers = None
+            working_caches = self._kv_caches
+            first_cache = first_layer_kvcache
 
-        # NHD layout: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-        # num_blocks is at shape[0] for NHD layout
-        self._local_block_num = first_layer_kvcache.shape[0]
-        logger.info(f"[DEBUG] Updated _local_block_num to {self._local_block_num} from tensor shape[0]")
+        # ── Extract block_size from tensor shape ──
+        # The tensor shape is determined by the attention backend's get_kv_cache_shape().
+        # For FlashAttention: (num_blocks, 2, block_size, num_kv_heads, head_dim)
+        # config.block_size may differ (e.g. 528 for hybrid alignment),
+        # but the actual tensor uses kernel_block_size (e.g. 16).
+        self._local_block_size = first_cache.shape[2]
+        self._local_block_num = first_cache.shape[0]
         self._local_token_num = self._local_block_num * self._local_block_size
 
-        self._dtype = first_layer_kvcache.dtype
-        self._device = first_layer_kvcache.device
+        self._dtype = first_cache.dtype
+        self._device = first_cache.device
         self._device_mod = _get_device_module(self._device)
         self._save_stream = self._device_mod.Stream()
         self._load_stream = self._device_mod.Stream()
-        
-        # Adjust shape interpretation based on detected layout
-        if self._kv_cache_layout == "HND":
-            # HND: [num_blocks, 2, num_kv_heads, block_size, head_dim]
-            # shape[2] = num_kv_heads, shape[3] = block_size, shape[4] = head_dim
-            self._per_manager_location_spec_layer_shape = [first_layer_kvcache.shape[1],  # 2 (K and V)
-                                                           self._manager_block_size,
-                                                           first_layer_kvcache.shape[2] * first_layer_kvcache.shape[4]]
-            self._per_layer_token_key_dim_size = first_layer_kvcache.shape[2] * first_layer_kvcache.shape[4]
-        else:
-            # NHD: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-            # shape[3] = num_kv_heads, shape[4] = head_dim
-            self._per_manager_location_spec_layer_shape = [first_layer_kvcache.shape[1],  # 2 (K and V)
-                                                           self._manager_block_size,
-                                                           first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]]
-            self._per_layer_token_key_dim_size = first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]
-        
+
+        # ── Compute per-layer dimensions ──
+        # Shape: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+        # shape[3] = num_kv_heads, shape[4] = head_dim
+        self._per_layer_token_key_dim_size = first_cache.shape[3] * first_cache.shape[4]
+        self._per_layer_token_key_byte_size = self._per_layer_token_key_dim_size * self._dtype.itemsize
+        self._per_manager_location_spec_layer_shape = [
+            first_cache.shape[1],  # 2 (K and V)
+            self._manager_block_size,
+            self._per_layer_token_key_dim_size,
+        ]
         self._per_manager_location_spec_layer_byte_size = math.prod(
             self._per_manager_location_spec_layer_shape) * self._dtype.itemsize
-        self._per_layer_token_key_byte_size = (self._per_layer_token_key_dim_size * self._dtype.itemsize)
-        
-        # Debug: print detailed shape and stride information
-        logger.info(f"[DEBUG] Tensor shape: {first_layer_kvcache.shape}")
-        logger.info(f"[DEBUG] Tensor strides: {first_layer_kvcache.stride()}")
-        logger.info(f"[DEBUG] Tensor is_contiguous: {first_layer_kvcache.is_contiguous()}")
-        logger.info(f"[DEBUG] Detected layout: {self._kv_cache_layout}")
-        logger.info(f"[DEBUG] per_layer_token_key_dim_size: {self._per_layer_token_key_dim_size}")
-        logger.info(f"[DEBUG] per_layer_token_key_byte_size: {self._per_layer_token_key_byte_size}")
-        
-        # For hybrid models, skip the stride check as the layout may vary
-        logger.warning(f"[DEBUG] Skipping stride check for hybrid models")
-        assert self._per_manager_location_spec_layer_byte_size == 2 * self._manager_block_size * self._per_layer_token_key_byte_size
 
-        self._per_manager_location_spec_shape = [len(attn_layer_names)] + self._per_manager_location_spec_layer_shape
+        # ── Stride validation ──
+        # Verify adjacent tokens are separated by exactly per_layer_token_key_byte_size.
+        # This guards against incorrect shape interpretation.
+        actual_token_stride = (
+            first_cache[0][0][1].data_ptr() - first_cache[0][0][0].data_ptr()
+        )
+        assert actual_token_stride == self._per_layer_token_key_byte_size, (
+            f"Token stride mismatch: expected {self._per_layer_token_key_byte_size}, "
+            f"got {actual_token_stride}. Shape={first_cache.shape}, "
+            f"strides={first_cache.stride()}"
+        )
+        assert self._per_manager_location_spec_layer_byte_size == (
+            2 * self._manager_block_size * self._per_layer_token_key_byte_size
+        ), "Manager block byte size mismatch"
+
+        self._per_manager_location_spec_shape = (
+            [len(attn_layer_names)] + self._per_manager_location_spec_layer_shape
+        )
         self._per_manager_location_spec_byte_size = math.prod(
             self._per_manager_location_spec_shape) * self._dtype.itemsize
 
+        # ── Build pointer tensors from working caches (contiguous copies for strided) ──
         self._kvcache_ptr_tensor_cpu = torch.tensor(
-            [self._kv_caches[name].data_ptr() for name in attn_layer_names],
-            dtype=torch.int64,
-            device="cpu"
+            [working_caches[name].data_ptr() for name in attn_layer_names],
+            dtype=torch.int64, device="cpu",
         )
         self._kvcache_ptr_tensor_gpu = self._kvcache_ptr_tensor_cpu.to(self._device)
+
         if self._use_mla:
             self._all_kvcache_ptr_tensor_cpu = torch.tensor(
-                [self._kv_caches[name].data_ptr() for name in attn_layer_names],
-                dtype=torch.int64,
-                device="cpu"
+                [working_caches[name].data_ptr() for name in attn_layer_names],
+                dtype=torch.int64, device="cpu",
             )
         else:
             kvcache_ptrs = []
             for name in attn_layer_names:
-                kvcache_ptrs.append(self._kv_caches[name][0].data_ptr())
-                kvcache_ptrs.append(self._kv_caches[name][1].data_ptr())
+                kvcache_ptrs.append(working_caches[name][0].data_ptr())  # K base
+                kvcache_ptrs.append(working_caches[name][1].data_ptr())  # V base
             self._all_kvcache_ptr_tensor_cpu = torch.tensor(
-                kvcache_ptrs,
-                dtype=torch.int64,
-                device="cpu"
+                kvcache_ptrs, dtype=torch.int64, device="cpu",
             )
         self._all_kvcache_ptr_tensor_gpu = self._all_kvcache_ptr_tensor_cpu.to(self._device)
 
-        self._copy_buffer_allocator = CopyBufferAllocator(torch.device("cpu"), self._dtype,
-                                                          self._per_manager_location_spec_shape, 1024)
+        self._copy_buffer_allocator = CopyBufferAllocator(
+            torch.device("cpu"), self._dtype,
+            self._per_manager_location_spec_shape, 1024,
+        )
 
     def _register_hybrid_kv_caches(self, hybrid_layer_names):
         """Register hybrid (mamba/gdn/linear) layer state caches.
@@ -701,6 +691,9 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._device,
             self._dtype,
             hybrid_info,
+            attn_contiguous_buffers=self._attn_contiguous_buffers,
+            attn_strided_tensors=self._attn_strided_tensors,
+            has_strided_attn=self._attn_strided_tensors is not None,
         )
 
         # Initialize DataTransferManager
