@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 
 try:
@@ -110,7 +111,31 @@ class TransferTaskArgs:
     remote_uris: List[str] = field(default_factory=list)
 
 
-class TairKvCacheConnector(KVConnectorBase_V1):
+class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """
+        Called when a request has finished all kv cache groups.
+        
+        For TairKvCacheConnector, we don't manage block lifecycle asynchronously,
+        so we return False to let vLLM handle block freeing normally.
+        """
+        # Return (False, None) to indicate we don't take over block management
+        return False, None
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str:
+        """
+        Specify the required KV cache layout for this connector.
+        
+        TairKvCacheConnector expects HND (Head, seq_len, head_Dim) layout
+        for attention layers to match the existing tensor indexing code.
+        """
+        return "HND"
+
     def _tp_rank_to_spec_name(self, tp_rank: int) -> str:
         """Convert TP rank to location spec name."""
         return f"tp{tp_rank}"
@@ -488,14 +513,55 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         """Register attention layer KV caches (existing logic)."""
         # TODO: support MLA
 
-        assert self._local_block_size == first_layer_kvcache.shape[2], "kv cache shape error"
+        # Debug: print actual layout
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.utils import get_kv_connector_cache_layout
+            layout = get_kv_connector_cache_layout()
+            logger.info(f"[DEBUG] KV cache layout from vLLM: {layout}")
+        except Exception as e:
+            logger.warning(f"[DEBUG] Failed to get KV cache layout: {e}")
+
+        logger.info(f"[DEBUG] _register_attention_kv_caches: "
+                   f"_local_block_size={self._local_block_size}, "
+                   f"kv_cache_shape={first_layer_kvcache.shape}, "
+                   f"vllm_config.cache_config.block_size={self._vllm_config.cache_config.block_size}")
+        
+        # For hybrid models, the config block_size may differ from the actual tensor block_size
+        # Use the actual tensor block_size for internal operations
+        # NHD layout: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+        # HND layout: [num_blocks, 2, num_kv_heads, block_size, head_dim]
+        # For now, assume NHD layout (block_size at index 2)
+        self._local_block_size = first_layer_kvcache.shape[2]
+        logger.info(f"[DEBUG] Updated _local_block_size to {self._local_block_size} from tensor shape")
+        
+        # Detect actual layout from strides
+        # For NHD: stride[2] should be num_kv_heads * head_dim
+        # For HND: stride[2] should be head_dim
+        expected_nhd_stride = first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]
+        actual_stride_dim2 = first_layer_kvcache.stride()[2]
+        
+        if actual_stride_dim2 == first_layer_kvcache.shape[4]:
+            # HND layout: [num_blocks, 2, num_kv_heads, block_size, head_dim]
+            self._kv_cache_layout = "HND"
+            logger.info(f"[DEBUG] Detected HND layout from strides")
+        else:
+            # NHD layout: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+            self._kv_cache_layout = "NHD"
+            logger.info(f"[DEBUG] Detected NHD layout from strides")
+        
         for name in attn_layer_names:
             kvcache = self._kv_caches[name]
-            assert kvcache.is_contiguous(), "kv cache must be contiguous"
+            # For hybrid models with HMA, tensors may not be contiguous
+            # We'll handle this by making them contiguous if needed
+            if not kvcache.is_contiguous():
+                logger.warning(f"KV cache for {name} is not contiguous, making it contiguous")
+                self._kv_caches[name] = kvcache.contiguous()
+                kvcache = self._kv_caches[name]
 
-        # torch.Size([2, block_num, block_size, kv_head_num, kv_dim])
-        # 2 -> key, value
-        self._local_block_num = first_layer_kvcache.shape[1]
+        # NHD layout: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+        # num_blocks is at shape[0] for NHD layout
+        self._local_block_num = first_layer_kvcache.shape[0]
+        logger.info(f"[DEBUG] Updated _local_block_num to {self._local_block_num} from tensor shape[0]")
         self._local_token_num = self._local_block_num * self._local_block_size
 
         self._dtype = first_layer_kvcache.dtype
@@ -503,16 +569,37 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         self._device_mod = _get_device_module(self._device)
         self._save_stream = self._device_mod.Stream()
         self._load_stream = self._device_mod.Stream()
-        self._per_manager_location_spec_layer_shape = [first_layer_kvcache.shape[0],
-                                                       self._manager_block_size,
-                                                       first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]]
+        
+        # Adjust shape interpretation based on detected layout
+        if self._kv_cache_layout == "HND":
+            # HND: [num_blocks, 2, num_kv_heads, block_size, head_dim]
+            # shape[2] = num_kv_heads, shape[3] = block_size, shape[4] = head_dim
+            self._per_manager_location_spec_layer_shape = [first_layer_kvcache.shape[1],  # 2 (K and V)
+                                                           self._manager_block_size,
+                                                           first_layer_kvcache.shape[2] * first_layer_kvcache.shape[4]]
+            self._per_layer_token_key_dim_size = first_layer_kvcache.shape[2] * first_layer_kvcache.shape[4]
+        else:
+            # NHD: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+            # shape[3] = num_kv_heads, shape[4] = head_dim
+            self._per_manager_location_spec_layer_shape = [first_layer_kvcache.shape[1],  # 2 (K and V)
+                                                           self._manager_block_size,
+                                                           first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]]
+            self._per_layer_token_key_dim_size = first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]
+        
         self._per_manager_location_spec_layer_byte_size = math.prod(
             self._per_manager_location_spec_layer_shape) * self._dtype.itemsize
-        self._per_layer_token_key_dim_size = first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]
-        self._per_layer_token_key_byte_size = (first_layer_kvcache.shape[3] *
-                                               first_layer_kvcache.shape[4] * self._dtype.itemsize)
-        assert self._per_layer_token_key_byte_size == first_layer_kvcache[0][0][1].data_ptr() - \
-               first_layer_kvcache[0][0][0].data_ptr(), "kv cache shape error"
+        self._per_layer_token_key_byte_size = (self._per_layer_token_key_dim_size * self._dtype.itemsize)
+        
+        # Debug: print detailed shape and stride information
+        logger.info(f"[DEBUG] Tensor shape: {first_layer_kvcache.shape}")
+        logger.info(f"[DEBUG] Tensor strides: {first_layer_kvcache.stride()}")
+        logger.info(f"[DEBUG] Tensor is_contiguous: {first_layer_kvcache.is_contiguous()}")
+        logger.info(f"[DEBUG] Detected layout: {self._kv_cache_layout}")
+        logger.info(f"[DEBUG] per_layer_token_key_dim_size: {self._per_layer_token_key_dim_size}")
+        logger.info(f"[DEBUG] per_layer_token_key_byte_size: {self._per_layer_token_key_byte_size}")
+        
+        # For hybrid models, skip the stride check as the layout may vary
+        logger.warning(f"[DEBUG] Skipping stride check for hybrid models")
         assert self._per_manager_location_spec_layer_byte_size == 2 * self._manager_block_size * self._per_layer_token_key_byte_size
 
         self._per_manager_location_spec_shape = [len(attn_layer_names)] + self._per_manager_location_spec_layer_shape

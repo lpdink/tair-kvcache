@@ -16,3 +16,4 @@ __pycache__/
 !.aoneci
 compile_commands.json
 stub_source
+*.so
