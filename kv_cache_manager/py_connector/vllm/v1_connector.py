@@ -743,6 +743,9 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
 
+        # Reset wait state for this forward pass (第四轮修复 P0-2)
+        self._load_futures_waited = set()
+
         # Collect all load futures to wait for them later
         self._load_futures = []
 

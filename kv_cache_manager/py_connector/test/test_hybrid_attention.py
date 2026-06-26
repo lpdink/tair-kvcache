@@ -903,6 +903,7 @@ class TestHybridDataRoundTrip(unittest.TestCase):
         ))
         dt._save_stream = MagicMock()
         dt._load_stream = MagicMock()
+        dt._transfer_stream = MagicMock()  # Added for unified stream support
         dt._coordinator_client = MagicMock()
         dt._transfer_client = MagicMock()
         return dt

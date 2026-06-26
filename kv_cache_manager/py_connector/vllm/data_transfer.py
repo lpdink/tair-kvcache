@@ -409,7 +409,7 @@ class DataTransferManager:
 
         if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
             # Scatter from CPU buffer to GPU hybrid state (block-level memcpy via tensor indexing)
-            with self._device_mod.stream(self._load_stream):
+            with self._device_mod.stream(self._transfer_stream):
                 gpu_buffer = cpu_buffer.to(device, non_blocking=True)
                 for i, block_idx in enumerate(block_indices):
                     for layer_idx in range(info.layer_num):
@@ -418,7 +418,7 @@ class DataTransferManager:
                         info.block_view_tensors[layer_idx][block_idx].copy_(src_slice)
 
                 copy_done_event = self._device_mod.Event()
-                copy_done_event.record(self._load_stream)
+                copy_done_event.record(self._transfer_stream)
             copy_done_event.synchronize()
         else:
             logger.warning("hybrid load task failed, remote_uris:%s, transfer_result:%s",
@@ -442,7 +442,7 @@ class DataTransferManager:
         device = self._kvcache_info.device
 
         # Gather from GPU hybrid state to GPU buffer (block-level memcpy via tensor indexing)
-        with self._device_mod.stream(self._save_stream):
+        with self._device_mod.stream(self._transfer_stream):
             kvcache_ready_event.wait()
 
             gpu_buffer = torch.empty(len(block_indices) * per_block_bytes, dtype=torch.uint8, device=device)
@@ -453,7 +453,7 @@ class DataTransferManager:
                     gpu_buffer[dst_offset:dst_offset + info.page_size_bytes].copy_(src_slice)
 
             copy_done_event = self._device_mod.Event()
-            copy_done_event.record(self._save_stream)
+            copy_done_event.record(self._transfer_stream)
 
         copy_done_event.synchronize()
 
