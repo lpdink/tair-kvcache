@@ -1161,16 +1161,27 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 state_to_worker.new_local_block_ids = request.local_block_ids
             else:
                 if cached_reqs.new_block_ids[idx] is None:
-                    # https://github.com/vllm-project/vllm/pull/23262
-                    continue
-                new_block_ids = cached_reqs.new_block_ids[idx][0]
-                request.local_block_ids.extend(new_block_ids)
-                state_to_worker.new_local_block_ids = new_block_ids
+                    # vLLM v0.23+ optimization: new_block_ids is None when no new blocks
+                    # were allocated this step (e.g., reusing existing blocks).
+                    # We MUST still send the state update to workers for token_ids sync,
+                    # otherwise the worker's local_block_ids will fall behind and cause
+                    # an assertion failure in generate_blocks_idx during save.
+                    state_to_worker.new_local_block_ids = []
+                else:
+                    new_block_ids = cached_reqs.new_block_ids[idx][0]
+                    request.local_block_ids.extend(new_block_ids)
+                    state_to_worker.new_local_block_ids = new_block_ids
             meta.add_req_state_to_worker(state_to_worker)
 
         for req in self._alive_requests.values():
-            target_save_num = min(len(req.token_ids),
-                                  len(req.local_block_ids) * self._local_block_size) // self._manager_block_size
+            # Safety cap: never target more manager blocks than local blocks we have.
+            # The scheduler's local_block_ids may include blocks not yet synced to workers.
+            # Without this cap, generate_blocks_idx on the worker can access
+            # out-of-bounds local_block_ids and crash.
+            target_save_num = min(
+                len(req.token_ids) // self._manager_block_size,
+                len(req.local_block_ids),
+            )
             if target_save_num > req.has_saved_block_num:
                 req.scheduled_saving_count += 1
                 self._http_executor.submit(
