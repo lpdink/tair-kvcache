@@ -2,8 +2,11 @@
 Shared utilities and configuration for E2E tests
 """
 
+import re
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
+import requests
 
 
 # ============================================================================
@@ -11,7 +14,9 @@ from typing import Dict, Any
 # ============================================================================
 KVCMSERVER_HOST = "localhost"
 KVCMSERVER_PORT = 6382
+KVCMSERVER_ADMIN_PORT = 6492
 KVCMSERVER_BASE_URL = f"http://{KVCMSERVER_HOST}:{KVCMSERVER_PORT}"
+KVCMSERVER_ADMIN_URL = f"http://{KVCMSERVER_HOST}:{KVCMSERVER_ADMIN_PORT}"
 
 MODEL_PATH = "/root/ws/resources/models/Qwen3.5-4B"
 MODEL_NAME = "Qwen3.5-4B"
@@ -52,8 +57,25 @@ def get_connector_config() -> Dict[str, Any]:
     }
 
 
-def get_register_payload() -> Dict[str, Any]:
-    """Get register instance payload with hybrid specs"""
+def get_register_payload(tp_size: int = 1) -> Dict[str, Any]:
+    """Get register instance payload with hybrid specs.
+    
+    Args:
+        tp_size: Tensor parallel size (default: 1)
+    """
+    # Generate location specs for each TP rank
+    location_spec_infos = []
+    attn_specs = []
+    hybrid_specs = []
+    
+    for rank in range(tp_size):
+        attn_spec_name = f"tp{rank}"
+        hybrid_spec_name = f"tp{rank}_hybrid"
+        location_spec_infos.append({"name": attn_spec_name, "size": 1024 * 1024 * 100})
+        location_spec_infos.append({"name": hybrid_spec_name, "size": 1024 * 1024 * 50})
+        attn_specs.append(attn_spec_name)
+        hybrid_specs.append(hybrid_spec_name)
+    
     return {
         "trace_id": "test_register_001",
         "instance_id": "test-instance-001",
@@ -63,19 +85,51 @@ def get_register_payload() -> Dict[str, Any]:
             "model_name": MODEL_NAME,
             "dtype": DTYPE,
             "use_mla": False,
-            "tp_size": 1,
+            "tp_size": tp_size,
             "dp_size": 1,
             "pp_size": 1,
         },
-        "location_spec_infos": [
-            {"name": "tp0", "size": 1024 * 1024 * 100},
-            {"name": "tp0_hybrid", "size": 1024 * 1024 * 50},
-        ],
+        "location_spec_infos": location_spec_infos,
         "location_spec_groups": [
-            {"name": "Full", "spec_names": ["tp0"]},
-            {"name": "FullAndHybrid", "spec_names": ["tp0", "tp0_hybrid"]},
+            {"name": "Full", "spec_names": attn_specs},
+            {"name": "FullAndHybrid", "spec_names": attn_specs + hybrid_specs},
         ],
     }
+
+
+def get_kvcm_metrics(metric_name: str) -> Optional[float]:
+    """Query KVCM Prometheus metrics endpoint.
+    
+    Multiple instances may each have their own counter; this function
+    sums all matching values for counter-type metrics.
+    
+    Args:
+        metric_name: Metric name to query (e.g., "kvcm_manager_get_cache_location_hit_block_counter")
+        
+    Returns:
+        Sum of metric values as float, or None if metric not found or endpoint unavailable.
+    """
+    try:
+        resp = requests.get(f"{KVCMSERVER_ADMIN_URL}/metrics", timeout=5)
+        if resp.status_code != 200:
+            print(f"⚠ Prometheus endpoint returned {resp.status_code}")
+            return None
+        
+        # Parse Prometheus text format
+        # Multiple lines may match (one per instance/label set) — sum them.
+        pattern = rf'^{re.escape(metric_name)}(?:\{{[^}}]*\}})?\s+([\d.eE+-]+)$'
+        total = 0.0
+        found = False
+        for line in resp.text.splitlines():
+            match = re.match(pattern, line)
+            if match:
+                total += float(match.group(1))
+                found = True
+        
+        return total if found else None
+    except Exception as e:
+        print(f"⚠ Failed to query Prometheus metrics: {e}")
+        return None
 
 
 def print_header(title: str):

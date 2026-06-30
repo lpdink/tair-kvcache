@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-TairKvCacheConnector Hybrid Attention E2E Test Suite
+TairKvCacheConnector E2E Test Suite
 
 Main test runner that orchestrates all E2E tests and generates a report.
+Tests 1-3 are single-GPU baselines; tests 4-6 run with TP=2 and verify
+cache hit behavior via Prometheus metrics.
 
 Usage:
     python run_e2e_tests.py [--test NUM] [--skip NUM]
 
 Options:
-    --test NUM    Run only test NUM (e.g., --test 2)
+    --test NUM    Run only test NUM (e.g., --test 6)
     --skip NUM    Skip test NUM (can be used multiple times)
 """
 
@@ -22,6 +24,7 @@ from e2e_tests.test_02_model_loading import test_model_loading_with_connector
 from e2e_tests.test_03_generation import test_simple_generation
 from e2e_tests.test_04_roundtrip import test_save_load_roundtrip
 from e2e_tests.test_05_multiple_cycles import test_multiple_cycles
+from e2e_tests.test_06_tp_cache_verification import test_tp_cache_verification
 
 
 # Test registry
@@ -29,8 +32,9 @@ TESTS: Dict[int, tuple[str, Callable[[], bool]]] = {
     1: ("Basic Connectivity", test_basic_connectivity),
     2: ("Model Loading with Connector", test_model_loading_with_connector),
     3: ("Simple Generation", test_simple_generation),
-    4: ("Save → Load Round-Trip", test_save_load_roundtrip),
-    5: ("Multiple Cycles", test_multiple_cycles),
+    4: ("Save → Load Round-Trip (TP=2)", test_save_load_roundtrip),
+    5: ("Multiple Cycles (TP=2)", test_multiple_cycles),
+    6: ("Multi-GPU TP Cache Verification", test_tp_cache_verification),
 }
 
 
@@ -42,8 +46,8 @@ def main():
     
     # Print header
     print("\n" + "="*80)
-    print("TairKvCacheConnector Hybrid Attention E2E Test Suite")
-    print("Testing: Qwen3.5-4B (GDN/Mamba + Attention)")
+    print("TairKvCacheConnector E2E Test Suite")
+    print("Testing: Qwen3.5-4B (GDN/Mamba + Attention) with TP=1/2")
     print("="*80)
     
     # Determine which tests to run
