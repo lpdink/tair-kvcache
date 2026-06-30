@@ -1220,6 +1220,10 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if self._has_hybrid:
             # In mamba_cache_mode="all", every block has both attention and hybrid state
             request["location_spec_group_names"] = ["FullAndHybrid"] * target_save_num
+            # Pre-fill block_keys with placeholders to match location_spec_group_names size.
+            # The server checks keys.size() == group_names.size() BEFORE generating real keys
+            # from tokens. The server will re-generate actual keys from token_ids regardless.
+            request["block_keys"] = list(range(target_save_num))
         logger.debug("start_write_cache req: %s", request)
         try:
             response = self._manager_client.start_write_cache(request)
