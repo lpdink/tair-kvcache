@@ -353,35 +353,122 @@ class TestDetectHybridLayers(unittest.TestCase):
 class TestGenerateHybridBlockIndices(unittest.TestCase):
     """Test per-block index generation for hybrid transfer."""
 
-    def _make_connector(self, manager_block_size=16, local_block_size=16):
+    def _make_connector(self, manager_block_size=16, vllm_block_size=16, local_block_size=16):
         c = TairKvCacheConnector.__new__(TairKvCacheConnector)
         c._manager_block_size = manager_block_size
+        c._vllm_block_size = vllm_block_size
         c._local_block_size = local_block_size
         return c
 
     def test_basic_mapping(self):
-        """Simple case: manager_block_size == local_block_size."""
-        c = self._make_connector(16, 16)
+        """Simple case: manager_block_size == vllm_block_size == local_block_size."""
+        c = self._make_connector(16, 16, 16)
         local_block_ids = [10, 11, 12, 13, 14]
-        # manager_block_idxes [0, 1, 3] → token_idx [0, 16, 48] → local_block_idx [0, 1, 3]
+        # manager_block_idxes [0, 1, 3] → token_idx [0, 16, 48] → logical_block_idx [0, 1, 3]
         result = c.generate_hybrid_block_indices([0, 1, 3], local_block_ids)
         self.assertEqual(result, [10, 11, 13])
 
     def test_different_block_sizes(self):
-        """manager_block_size != local_block_size."""
-        c = self._make_connector(32, 16)  # manager=32 tokens, local=16 tokens
+        """manager_block_size != vllm_block_size."""
+        c = self._make_connector(32, 32, 16)  # manager=32, vllm=32, local=16
         local_block_ids = [10, 11, 12, 13, 14, 15]
-        # manager_block_idx=0 → token_idx=0 → local_block_idx=0 → local_block_ids[0]=10
-        # manager_block_idx=1 → token_idx=32 → local_block_idx=2 → local_block_ids[2]=12
+        # manager_block_idx=0 → token_idx=0 → logical_block_idx=0 → 10
+        # manager_block_idx=1 → token_idx=32 → logical_block_idx=1 → 11
         result = c.generate_hybrid_block_indices([0, 1], local_block_ids)
-        self.assertEqual(result, [10, 12])
+        self.assertEqual(result, [10, 11])
+
+    def test_hybrid_model_vllm528_local16(self):
+        """Hybrid model: manager=528, vllm=528, local=16, ratio=33."""
+        c = self._make_connector(528, 528, 16)
+        local_block_ids = [5]  # one logical block allocated
+        # manager_block_idx=0 → token_idx=0 → logical_block_idx=0 → 5
+        result = c.generate_hybrid_block_indices([0], local_block_ids)
+        self.assertEqual(result, [5])
 
     def test_out_of_bounds_raises(self):
         """Block index beyond local_block_ids raises AssertionError."""
-        c = self._make_connector(16, 16)
+        c = self._make_connector(16, 16, 16)
         local_block_ids = [10, 11]
         with self.assertRaises(AssertionError):
             c.generate_hybrid_block_indices([0, 5], local_block_ids)
+
+    def test_out_of_bounds_message_contains_context(self):
+        """AssertionError message includes diagnostic context."""
+        c = self._make_connector(528, 528, 16)
+        local_block_ids = [5]
+        with self.assertRaises(AssertionError) as ctx:
+            c.generate_hybrid_block_indices([0, 1], local_block_ids)
+        msg = str(ctx.exception)
+        self.assertIn("vllm_bs", msg)
+        self.assertIn("528", msg)
+
+
+class TestGenerateBlocksIdx(unittest.TestCase):
+    """Test per-token index generation for attention transfer."""
+
+    def _make_connector(self, manager_block_size=16, vllm_block_size=16, local_block_size=16):
+        c = TairKvCacheConnector.__new__(TairKvCacheConnector)
+        c._manager_block_size = manager_block_size
+        c._vllm_block_size = vllm_block_size
+        c._local_block_size = local_block_size
+        return c
+
+    def test_non_hybrid_ratio1(self):
+        """Non-hybrid model: ratio=1, backward-compatible behavior."""
+        c = self._make_connector(16, 16, 16)
+        local_block_ids = [5]
+        result = c.generate_blocks_idx([0], local_block_ids)
+        # 1 block, 16 tokens each: flat indices 80..95
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]), 16)
+        self.assertEqual(result[0], list(range(80, 96)))
+
+    def test_hybrid_ratio33(self):
+        """Hybrid model: manager=528, vllm=528, local=16, ratio=33."""
+        c = self._make_connector(528, 528, 16)
+        local_block_ids = [5]  # one logical block → physical blocks 165..197
+        result = c.generate_blocks_idx([0], local_block_ids)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]), 528)
+        # First token: physical_block = 5*33 + 0 = 165, flat = 165*16 + 0 = 2640
+        self.assertEqual(result[0][0], 2640)
+        # Token 15 (last in first physical block): flat = 165*16 + 15 = 2655
+        self.assertEqual(result[0][15], 2655)
+        # Token 16 (first in second physical block): physical_block = 5*33 + 1 = 166, flat = 166*16 + 0 = 2656
+        self.assertEqual(result[0][16], 2656)
+        # Last token (527): physical_block = 5*33 + 32 = 197, flat = 197*16 + 15 = 3167
+        self.assertEqual(result[0][527], 3167)
+
+    def test_hybrid_two_logical_blocks(self):
+        """Hybrid model with two logical blocks allocated."""
+        c = self._make_connector(528, 528, 16)
+        local_block_ids = [3, 7]  # two logical blocks
+        # manager_block_idx=0 covers tokens 0-527, all in logical block 0 (local_block_id=3)
+        result = c.generate_blocks_idx([0], local_block_ids)
+        # First token: physical_block = 3*33 + 0 = 99, flat = 99*16 + 0 = 1584
+        self.assertEqual(result[0][0], 1584)
+        # Last token: physical_block = 3*33 + 32 = 131, flat = 131*16 + 15 = 2111
+        self.assertEqual(result[0][527], 2111)
+
+    def test_out_of_bounds_raises(self):
+        """AssertionError when block index exceeds local_block_ids length."""
+        c = self._make_connector(528, 528, 16)
+        local_block_ids = [5]
+        # manager_block_idx=1 covers tokens 528-1055, which need logical block 1
+        with self.assertRaises(AssertionError) as ctx:
+            c.generate_blocks_idx([0, 1], local_block_ids)
+        msg = str(ctx.exception)
+        self.assertIn("logical_block_idx", msg)
+        self.assertIn("ratio", msg)
+
+    def test_non_hybrid_multiple_blocks(self):
+        """Non-hybrid with multiple manager blocks."""
+        c = self._make_connector(16, 16, 16)
+        local_block_ids = [2, 5, 8]
+        result = c.generate_blocks_idx([0, 2], local_block_ids)
+        # Block 0: flat 32..47, Block 2: flat 128..143
+        self.assertEqual(result[0], list(range(32, 48)))
+        self.assertEqual(result[1], list(range(128, 144)))
 
 
 # ============================================================================
@@ -788,6 +875,7 @@ class TestRegisterKvCaches(unittest.TestCase):
         c = TairKvCacheConnector.__new__(TairKvCacheConnector)
         c._has_hybrid = True
         c._tp_size = 1
+        c._vllm_block_size = 16
         c._local_block_size = 16
         c._manager_block_size = 16
         c._device = torch.device("cpu")
@@ -1096,6 +1184,20 @@ class TestLocationSpecGroupNames(unittest.TestCase):
             c.start_save_kvcache_async("req", list(range(n * 16)), n)
             call_args = c._manager_client.start_write_cache.call_args[0][0]
             self.assertEqual(len(call_args["location_spec_group_names"]), n)
+
+    def test_block_keys_always_empty(self):
+        """block_keys should always be empty, server generates keys from token_ids."""
+        # Test hybrid model
+        c_hybrid = self._make_connector(has_hybrid=True)
+        c_hybrid.start_save_kvcache_async("req1", list(range(80)), 5)
+        call_args = c_hybrid._manager_client.start_write_cache.call_args[0][0]
+        self.assertEqual(call_args["block_keys"], [])
+        
+        # Test pure attention model
+        c_pure = self._make_connector(has_hybrid=False)
+        c_pure.start_save_kvcache_async("req2", list(range(80)), 5)
+        call_args = c_pure._manager_client.start_write_cache.call_args[0][0]
+        self.assertEqual(call_args["block_keys"], [])
 
 
 # ============================================================================

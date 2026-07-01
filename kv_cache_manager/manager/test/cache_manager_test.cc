@@ -656,6 +656,108 @@ TEST_F(CacheManagerTest, TestStartWriteCacheWithLocationSpecGroup) {
     }
 }
 
+// Test: StartWriteCache with empty keys but valid tokens (pure attention path)
+// This verifies that when block_keys is empty, the server generates keys from token_ids
+TEST_F(CacheManagerTest, TestStartWriteCacheWithEmptyKeysAndTokens) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance_empty_keys",
+                                               528,  // block_size must match token count
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // Provide 528 tokens (1 block worth of data), but empty keys
+    // Server should generate 1 hash-based key from tokens
+    std::vector<int64_t> tokens(528, 12345);  // 528 tokens with value 12345
+    auto [ec, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance_empty_keys", {}, tokens, {}, 1000);
+    ASSERT_EQ(EC_OK, ec);
+    const auto &cache_locations_view = start_write_cache_info.locations().cache_locations_view();
+    ASSERT_EQ(1, cache_locations_view.size());  // Should generate 1 location from 528 tokens
+}
+
+// Test: StartWriteCache with empty keys, valid tokens, and location_spec_group_names (hybrid attention)
+// This verifies the fix for the key validation ordering bug
+TEST_F(CacheManagerTest, TestStartWriteCacheWithEmptyKeysAndTokensAndSpecGroups) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_F0", 512),
+        LocationSpecInfo("tp1_F0", 512),
+        LocationSpecInfo("tp0_L1", 512),
+        LocationSpecInfo("tp1_L1", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("FullAndHybrid", {"tp0_F0", "tp1_F0", "tp0_L1", "tp1_L1"}),
+    };
+
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance_hybrid",
+                                               528,  // block_size must match token count
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+
+    // Provide 528 tokens (1 block), empty keys, and 1 location_spec_group_name
+    // Server should generate 1 key from tokens, then validate that query_keys.size() (1) == group_names.size() (1)
+    std::vector<int64_t> tokens(528, 67890);
+    auto [ec, start_write_cache_info] = cache_manager_->StartWriteCache(
+        request_context_.get(), "test_instance_hybrid", {}, tokens, {"FullAndHybrid"}, 1000);
+    ASSERT_EQ(EC_OK, ec);
+    const auto &cache_locations_view = start_write_cache_info.locations().cache_locations_view();
+    ASSERT_EQ(1, cache_locations_view.size());
+    
+    // Verify the location has the correct spec group (FullAndHybrid with 4 specs)
+    const auto &cache_location = cache_locations_view[0];
+    ASSERT_EQ(4, cache_location.spec_size());
+    const auto &location_specs = cache_location.location_specs();
+    ASSERT_EQ(4, location_specs.size());
+}
+
+// Test: StartWriteCache with mismatched keys and location_spec_group_names count
+// This verifies that the validation correctly rejects mismatched counts
+TEST_F(CacheManagerTest, TestStartWriteCacheWithMismatchedKeysAndSpecGroups) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_F0", 512),
+        LocationSpecInfo("tp1_F0", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("F0", {"tp0_F0", "tp1_F0"}),
+    };
+
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance_mismatch",
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+
+    // Provide 1 key but 2 location_spec_group_names - should fail
+    std::vector<int64_t> keys{1};
+    auto [ec1, info1] = cache_manager_->StartWriteCache(
+        request_context_.get(), "test_instance_mismatch", keys, {}, {"F0", "F0"}, 1000);
+    ASSERT_EQ(EC_ERROR, ec1);
+
+    // Provide 2 keys but 1 location_spec_group_name - should fail
+    std::vector<int64_t> keys2{1, 2};
+    auto [ec2, info2] = cache_manager_->StartWriteCache(
+        request_context_.get(), "test_instance_mismatch", keys2, {}, {"F0"}, 1000);
+    ASSERT_EQ(EC_ERROR, ec2);
+
+    // Provide 1056 tokens (2 blocks) but 1 location_spec_group_name - should fail
+    std::vector<int64_t> tokens(1056, 11111);
+    auto [ec3, info3] = cache_manager_->StartWriteCache(
+        request_context_.get(), "test_instance_mismatch", {}, tokens, {"F0"}, 1000);
+    ASSERT_EQ(EC_ERROR, ec3);
+}
+
 TEST_F(CacheManagerTest, TestWriteCacheTimeout) {
     cache_manager_->reclaimer_task_supervisor_->Stop();
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);

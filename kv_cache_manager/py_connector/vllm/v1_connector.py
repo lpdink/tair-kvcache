@@ -200,6 +200,11 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_caches: Optional[dict[str, torch.Tensor]] = None
         self._attn_strided_tensors: Optional[dict[str, torch.Tensor]] = None
         self._attn_contiguous_buffers: Optional[dict[str, torch.Tensor]] = None
+        # Scheduler's logical block size — used to index local_block_ids.
+        # Must NOT be overwritten by register_kv_caches.
+        self._vllm_block_size = vllm_config.cache_config.block_size
+        # Kernel's physical block size — may be overwritten by register_kv_caches
+        # to tensor.shape[2] for hybrid models where cache_config.block_size != kernel_block_size.
         self._local_block_size = vllm_config.cache_config.block_size
 
         model_config = vllm_config.model_config
@@ -273,11 +278,14 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         location_spec_groups = []
 
         if self._has_hybrid:
-            # Add hybrid spec infos for each tp rank
+            # Add hybrid spec infos for each tp rank.
+            # Size must cover ALL hybrid layers packed into one buffer per block,
+            # matching what hybrid_save_task actually sends.
+            hybrid_total_bytes = self._hybrid_page_size_bytes * len(self._hybrid_layer_names)
             for rank in range(self._tp_size):
                 location_spec_infos.append({
                     "name": self._tp_rank_to_hybrid_spec_name(rank),
-                    "size": self._hybrid_page_size_bytes
+                    "size": hybrid_total_bytes
                 })
             # Define spec groups for hybrid attention
             all_attn_specs = [self._tp_rank_to_spec_name(r) for r in range(self._tp_size)]
@@ -367,7 +375,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             if self._has_hybrid:
                 self._hybrid_location_spec_name = self._tp_rank_to_hybrid_spec_name(self._tp_rank)
                 transfer_client_json["location_spec_infos"][self._hybrid_location_spec_name] = \
-                    self._hybrid_page_size_bytes
+                    self._hybrid_page_size_bytes * len(self._hybrid_layer_names)
             self._transfer_client_config = json.dumps(transfer_client_json)
 
             self._init_params = kvcm_py_client.InitParams()
@@ -448,16 +456,41 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
 
     def generate_blocks_idx(self, manager_block_idxes, local_block_ids):
+        """Map manager block indices to flat token indices in the KV cache tensor.
+
+        Three-tier block hierarchy:
+          Manager block  : _manager_block_size (e.g. 528) — KVCM server's unit
+          vLLM logical   : _vllm_block_size   (e.g. 528) — scheduler's allocation unit
+          Kernel physical: _local_block_size   (e.g. 16)  — tensor's storage unit
+
+        ratio = _vllm_block_size // _local_block_size (e.g. 33)
+        Each logical block occupies `ratio` consecutive physical blocks in the tensor.
+        """
+        ratio = self._vllm_block_size // self._local_block_size
         blocks_idx = []
         for manager_block_idx in manager_block_idxes:
-            # get kvcache index list
             block_idx = []
             for i in range(self._manager_block_size):
                 now_token_idx = manager_block_idx * self._manager_block_size + i
-                assert now_token_idx // self._local_block_size < len(local_block_ids)
-                local_block_id = local_block_ids[now_token_idx // self._local_block_size]
-                token_offset = now_token_idx % self._local_block_size
-                block_idx.append(local_block_id * self._local_block_size + token_offset)
+
+                # 1. Logical block index (into local_block_ids)
+                logical_block_idx = now_token_idx // self._vllm_block_size
+                assert logical_block_idx < len(local_block_ids), (
+                    f"logical_block_idx={logical_block_idx} out of range "
+                    f"(len={len(local_block_ids)}, ratio={ratio}, "
+                    f"vllm_bs={self._vllm_block_size}, local_bs={self._local_block_size})"
+                )
+                local_block_id = local_block_ids[logical_block_idx]
+
+                # 2. Token offset within the logical block
+                token_within_logical = now_token_idx % self._vllm_block_size
+
+                # 3. Physical block in tensor
+                physical_block = local_block_id * ratio + token_within_logical // self._local_block_size
+
+                # 4. Flat token index for gather/scatter kernel
+                token_within_physical = token_within_logical % self._local_block_size
+                block_idx.append(physical_block * self._local_block_size + token_within_physical)
             blocks_idx.append(block_idx)
         return blocks_idx
 
@@ -978,14 +1011,19 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         Unlike attention's generate_blocks_idx which produces per-token indices,
         hybrid state is per-block, so we only need one local block ID per manager block.
+
+        Hybrid state tensors are indexed by logical block IDs (scheduler's allocation unit),
+        so we use _vllm_block_size (not _local_block_size) for the lookup.
         """
         block_indices = []
         for manager_block_idx in manager_block_idxes:
             now_token_idx = manager_block_idx * self._manager_block_size
-            local_block_idx = now_token_idx // self._local_block_size
-            assert local_block_idx < len(local_block_ids), \
-                f"block index {local_block_idx} out of range (len={len(local_block_ids)})"
-            block_indices.append(local_block_ids[local_block_idx])
+            logical_block_idx = now_token_idx // self._vllm_block_size
+            assert logical_block_idx < len(local_block_ids), (
+                f"hybrid block index {logical_block_idx} out of range "
+                f"(len={len(local_block_ids)}, vllm_bs={self._vllm_block_size})"
+            )
+            block_indices.append(local_block_ids[logical_block_idx])
         return block_indices
 
     def get_finished(
@@ -1231,10 +1269,6 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if self._has_hybrid:
             # In mamba_cache_mode="all", every block has both attention and hybrid state
             request["location_spec_group_names"] = ["FullAndHybrid"] * target_save_num
-            # Pre-fill block_keys with placeholders to match location_spec_group_names size.
-            # The server checks keys.size() == group_names.size() BEFORE generating real keys
-            # from tokens. The server will re-generate actual keys from token_ids regardless.
-            request["block_keys"] = list(range(target_save_num))
         logger.debug("start_write_cache req: %s", request)
         try:
             response = self._manager_client.start_write_cache(request)
