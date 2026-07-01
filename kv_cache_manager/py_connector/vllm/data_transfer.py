@@ -420,6 +420,43 @@ class DataTransferManager:
                 copy_done_event = self._device_mod.Event()
                 copy_done_event.record(self._transfer_stream)
             copy_done_event.synchronize()
+            
+            # Debug: log hybrid load details
+            logger.debug(
+                "[HYBRID_LOAD_DEBUG] Loaded %d blocks: block_indices=%s, "
+                "layer_num=%d, page_size_bytes=%d, per_block_bytes=%d, "
+                "transfer_result=%s",
+                len(block_indices), block_indices, info.layer_num,
+                info.page_size_bytes, per_block_bytes, transfer_result
+            )
+            # Debug: print state statistics for first block, first layer
+            if len(block_indices) > 0:
+                with self._device_mod.stream(self._transfer_stream):
+                    first_block_idx = block_indices[0]
+                    first_layer_state = info.block_view_tensors[0][first_block_idx]
+                    # Compute statistics on CPU to avoid GPU sync overhead
+                    state_cpu = first_layer_state.cpu().float()
+                    logger.debug(
+                        "[HYBRID_LOAD_DEBUG] Block %d, Layer 0 state stats: "
+                        "shape=%s, dtype=%s, mean=%.6f, std=%.6f, min=%.6f, max=%.6f, "
+                        "sum=%.6f",
+                        first_block_idx, tuple(first_layer_state.shape),
+                        first_layer_state.dtype,
+                        state_cpu.mean().item(), state_cpu.std().item(),
+                        state_cpu.min().item(), state_cpu.max().item(),
+                        state_cpu.sum().item()
+                    )
+                    # Also check last layer for comparison
+                    if info.layer_num > 1:
+                        last_layer_state = info.block_view_tensors[info.layer_num - 1][first_block_idx]
+                        last_state_cpu = last_layer_state.cpu().float()
+                        logger.debug(
+                            "[HYBRID_LOAD_DEBUG] Block %d, Layer %d state stats: "
+                            "mean=%.6f, std=%.6f, sum=%.6f",
+                            first_block_idx, info.layer_num - 1,
+                            last_state_cpu.mean().item(), last_state_cpu.std().item(),
+                            last_state_cpu.sum().item()
+                        )
         else:
             logger.warning("hybrid load task failed, remote_uris:%s, transfer_result:%s",
                            remote_uris, transfer_result)
@@ -456,6 +493,30 @@ class DataTransferManager:
             copy_done_event.record(self._transfer_stream)
 
         copy_done_event.synchronize()
+
+        # Debug: log hybrid save details
+        logger.debug(
+            "[HYBRID_SAVE_DEBUG] Saving %d blocks: block_indices=%s, "
+            "layer_num=%d, page_size_bytes=%d, per_block_bytes=%d",
+            len(block_indices), block_indices, info.layer_num,
+            info.page_size_bytes, per_block_bytes
+        )
+        # Debug: print state statistics for first block, first layer
+        if len(block_indices) > 0:
+            with self._device_mod.stream(self._transfer_stream):
+                first_block_idx = block_indices[0]
+                first_layer_state = info.block_view_tensors[0][first_block_idx]
+                state_cpu = first_layer_state.cpu().float()
+                logger.debug(
+                    "[HYBRID_SAVE_DEBUG] Block %d, Layer 0 state stats: "
+                    "shape=%s, dtype=%s, mean=%.6f, std=%.6f, min=%.6f, max=%.6f, "
+                    "sum=%.6f",
+                    first_block_idx, tuple(first_layer_state.shape),
+                    first_layer_state.dtype,
+                    state_cpu.mean().item(), state_cpu.std().item(),
+                    state_cpu.min().item(), state_cpu.max().item(),
+                    state_cpu.sum().item()
+                )
 
         # Use pinned memory for efficient D2H transfer
         cpu_buffer = torch.empty(len(block_indices) * per_block_bytes, dtype=torch.uint8,

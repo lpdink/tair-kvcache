@@ -16,6 +16,10 @@ class LoadRequest:
     manager_block_idxes: list
     need_load_locations: list[dict]
     local_block_ids: list = field(default_factory=list)
+    # Token counts for computing Mamba/GDN state indices
+    # Required for post-load state copy in hybrid models
+    num_computed_tokens: int = 0
+    num_scheduled_tokens: int = 0
 
 
 @dataclass()

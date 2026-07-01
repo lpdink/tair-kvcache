@@ -774,6 +774,16 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        """Start loading KV cache from external storage.
+        
+        For hybrid models (Mamba/GDN), this method also handles post-load state
+        correction. vLLM's preprocess_mamba() runs before start_load_kv() in
+        execute_model(), so it copies state from prev_state_idx to curr_state_idx
+        using data that hasn't been loaded yet. After loading completes, we redo
+        this copy with the now-correct data.
+        
+        See: openspec/changes/fix-hybrid-state-load-timing/design.md
+        """
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
 
         # Reset wait state for this forward pass (第四轮修复 P0-2)
@@ -781,6 +791,11 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Collect all load futures to wait for them later
         self._load_futures = []
+        
+        # Track hybrid load info for post-load state correction
+        self._hybrid_load_info = []
+        
+        has_hybrid_loads = False
 
         for load_req in meta.to_load_requests:
             if len(load_req.need_load_locations) == 0:
@@ -803,6 +818,25 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     assert len(hybrid_uris) == len(hybrid_block_indices), \
                         f"hybrid_uris ({len(hybrid_uris)}) != hybrid_block_indices ({len(hybrid_block_indices)}), " \
                         f"locations may have mixed Full/FullAndHybrid groups"
+                    
+                    # Debug: log hybrid load setup
+                    logger.debug(
+                        "[HYBRID_LOAD_SETUP] req_id=%s, hybrid_uris=%d, hybrid_blocks=%d, "
+                        "manager_block_idxes=%s, local_block_ids=%s",
+                        load_req.req_id, len(hybrid_uris), len(hybrid_block_indices),
+                        load_req.manager_block_idxes, load_req.local_block_ids
+                    )
+                    
+                    # Store hybrid load info for post-load correction
+                    self._hybrid_load_info.append({
+                        'req_id': load_req.req_id,
+                        'loaded_block_indices': hybrid_block_indices,
+                        'all_local_block_ids': load_req.local_block_ids,
+                        'manager_block_idxes': load_req.manager_block_idxes,
+                        'num_computed_tokens': load_req.num_computed_tokens,
+                        'num_scheduled_tokens': load_req.num_scheduled_tokens,
+                    })
+                    has_hybrid_loads = True
 
             # Total tasks = attention tasks + hybrid tasks (merged into one MultiResult)
             attn_task_num = math.ceil(len(block_token_indices) / per_task_size)
@@ -841,6 +875,47 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._load_futures.append(future)
                 task_idx += 1
 
+        # CRITICAL: For hybrid models, we MUST wait for hybrid loads to complete
+        # BEFORE model forward starts. Unlike attention layers which have
+        # wait_for_layer_load() called on each attention layer, GDN/hybrid layers
+        # read self.kv_cache directly without any wait mechanism.
+        # If we don't wait here, GDN layers 0-2 will read stale/empty state
+        # before the load completes (wait_for_layer_load is only called on layer 3+).
+        if has_hybrid_loads:
+            logger.debug("[HYBRID_LOAD_SYNC] Waiting for %d hybrid load futures to complete before forward",
+                       len(self._load_futures))
+            # Use a reasonable timeout (30 seconds)
+            timeout_seconds = 30.0
+            for future in self._load_futures:
+                try:
+                    future.result(timeout=timeout_seconds)
+                except TimeoutError:
+                    logger.error("hybrid load_task timed out")
+                    future.cancel()
+                except Exception as e:
+                    logger.warning("hybrid load_task failed: %s", e)
+            
+            # Post-load hybrid state correction
+            # vLLM's preprocess_mamba runs before start_load_kv, so it copies
+            # stale/empty data from prev_state_idx to curr_state_idx.
+            # After loading, we redo this copy with the now-correct data.
+            for load_info in self._hybrid_load_info:
+                prev_idx = self._compute_prev_state_idx(
+                    load_info['num_computed_tokens'], self._vllm_block_size)
+                curr_idx = self._compute_curr_state_idx(
+                    load_info['num_computed_tokens'],
+                    load_info['num_scheduled_tokens'],
+                    self._vllm_block_size)
+                if prev_idx != -1 and prev_idx != curr_idx:
+                    self._redo_mamba_state_copy(
+                        load_info['req_id'], prev_idx, curr_idx,
+                        load_info['all_local_block_ids'])
+            self._hybrid_load_info = []
+            
+            # Clear futures after waiting - they're already done
+            self._load_futures = []
+            self._load_futures_waited = set()  # Reset so attention wait doesn't skip
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Wait for all load operations to complete.
 
@@ -878,6 +953,113 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     logger.warning("load_task failed: %s", e)
             # Clear futures after waiting
             self._load_futures = []
+            
+            # Post-load hybrid state correction
+            if self._has_hybrid and hasattr(self, '_hybrid_load_info') and self._hybrid_load_info:
+                for load_info in self._hybrid_load_info:
+                    prev_idx = self._compute_prev_state_idx(
+                        load_info['num_computed_tokens'], self._vllm_block_size)
+                    curr_idx = self._compute_curr_state_idx(
+                        load_info['num_computed_tokens'],
+                        load_info['num_scheduled_tokens'],
+                        self._vllm_block_size)
+                    if prev_idx != -1 and prev_idx != curr_idx:
+                        self._redo_mamba_state_copy(
+                            load_info['req_id'], prev_idx, curr_idx,
+                            load_info['all_local_block_ids'])
+                self._hybrid_load_info = []
+
+    def _compute_prev_state_idx(self, num_computed_tokens: int, block_size: int) -> int:
+        """Compute the block index where the previous state is stored.
+        
+        Matches vLLM's preprocess_mamba logic:
+        prev_state_idx = (num_computed_tokens - 1) // block_size
+        
+        Returns -1 for new requests (no previous state).
+        """
+        if num_computed_tokens == 0:
+            return -1
+        return (num_computed_tokens - 1) // block_size
+
+    def _compute_curr_state_idx(self, num_computed_tokens: int, num_scheduled_tokens: int, block_size: int) -> int:
+        """Compute the block index where the current state will be written.
+        
+        Matches vLLM's preprocess_mamba logic:
+        num_blocks = ceil((num_computed_tokens + num_scheduled_tokens) / block_size)
+        curr_state_idx = num_blocks - 1
+        """
+        total_tokens = num_computed_tokens + num_scheduled_tokens
+        num_blocks = math.ceil(total_tokens / block_size)
+        return num_blocks - 1
+
+    def _redo_mamba_state_copy(self, req_id: str, prev_idx: int, curr_idx: int, 
+                                  block_ids: list[int]) -> None:
+        """Redo the state copy that preprocess_mamba should have done.
+        
+        After loading hybrid state from external storage, we need to copy
+        state from prev_state_idx to curr_state_idx because preprocess_mamba
+        runs before start_load_kv and thus operated on empty/stale data.
+        
+        Args:
+            req_id: Request ID for logging
+            prev_idx: Block index of previous state
+            curr_idx: Block index where current state should be written
+            block_ids: List of local block IDs for this request
+        """
+        # Validate indices are within bounds
+        if prev_idx < 0 or prev_idx >= len(block_ids):
+            logger.warning(
+                "[HYBRID_STATE_REDO] req_id=%s: prev_idx=%d out of bounds "
+                "(len(block_ids)=%d), skipping state copy",
+                req_id, prev_idx, len(block_ids)
+            )
+            return
+            
+        if curr_idx < 0 or curr_idx >= len(block_ids):
+            logger.warning(
+                "[HYBRID_STATE_REDO] req_id=%s: curr_idx=%d out of bounds "
+                "(len(block_ids)=%d), skipping state copy",
+                req_id, curr_idx, len(block_ids)
+            )
+            return
+        
+        # Skip if same block (no copy needed)
+        if prev_idx == curr_idx:
+            return
+        
+        src_block = block_ids[prev_idx]
+        dst_block = block_ids[curr_idx]
+        
+        # Skip if same physical block
+        if src_block == dst_block:
+            return
+        
+        hybrid_info = self._kvcache_info.hybrid_info
+        if not hybrid_info or not hybrid_info.block_view_tensors:
+            logger.warning("[HYBRID_STATE_REDO] req_id=%s: no hybrid_info, skipping", req_id)
+            return
+        
+        logger.info(
+            "[HYBRID_STATE_REDO] req_id=%s: copying state from prev_idx=%d (block %d) "
+            "to curr_idx=%d (block %d), layers=%d",
+            req_id, prev_idx, src_block, curr_idx, dst_block, hybrid_info.layer_num
+        )
+        
+        # Copy state for all hybrid layers
+        for layer_idx in range(hybrid_info.layer_num):
+            hybrid_info.block_view_tensors[layer_idx][dst_block].copy_(
+                hybrid_info.block_view_tensors[layer_idx][src_block]
+            )
+        
+        # Log statistics for verification
+        first_layer_state = hybrid_info.block_view_tensors[0][dst_block]
+        state_cpu = first_layer_state.cpu().float()
+        logger.info(
+            "[HYBRID_STATE_REDO] req_id=%s: after copy, block %d layer 0: "
+            "mean=%.6f, std=%.6f, sum=%.6f",
+            req_id, dst_block,
+            state_cpu.mean().item(), state_cpu.std().item(), state_cpu.sum().item()
+        )
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata",
                       **kwargs) -> None:
@@ -1153,6 +1335,9 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 # vllm will call get_num_new_matched_tokens again
                 continue
             load_req.local_block_ids = request.local_block_ids
+            # Populate token counts for hybrid state index computation
+            load_req.num_computed_tokens = request.local_matched_token_num
+            load_req.num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(load_req.req_id, 0)
             meta.add_load_request(load_req)
         self._waiting_to_load_requests = []
 
