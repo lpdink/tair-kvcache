@@ -32,15 +32,17 @@ def pytorch_dtype_to_triton_dtype(torch_dtype):
 
 @triton.jit
 def kv_cache_batch_gather_kernel(
-        kv_cache_ptrs_ptr,  # 指针数组基址 [num_layers * kv_count]
+        kv_cache_ptrs_ptr,  # 指针数组基址 [num_layers]
         dst_ptr,  # 输出缓冲区 (pinned host memory)
         block_token_indices_ptr,  # [total_blocks, num_tokens_per_block]
         dst_block_indices_ptr,  # [total_blocks]
         total_blocks: int,  # 需要处理的总block数
         NUM_TOKENS_PER_BLOCK: tl.constexpr,
         NUM_DIMS_PER_TOKEN: tl.constexpr,
-        NUM_KVCACHE_PTRS: tl.constexpr,  # num_layers * kv_count
+        NUM_KVCACHE_PTRS: tl.constexpr,  # num_layers
         BLOCK_SIZE: tl.constexpr,  # 隐藏维度分块大小
+        PAGE_SIZE: tl.constexpr = 0,  # paged layout的page size (tokens per page)
+        IS_PAGED: tl.constexpr = False,  # 是否使用paged layout
         DTYPE: tl.constexpr = tl.float16,
 ):
     NUM_DIMS_PER_BLOCK = NUM_TOKENS_PER_BLOCK * NUM_DIMS_PER_TOKEN
@@ -61,7 +63,7 @@ def kv_cache_batch_gather_kernel(
                 * NUM_DIMS_PER_TOKEN
         )
 
-        # 3. 遍历所有KV缓存指针 (k/v for each layer)
+        # 3. 遍历所有KV缓存指针 (每个layer一个指针，K/V交错在同一个buffer中)
         for ptr_idx in tl.range(NUM_KVCACHE_PTRS):
             # 3.1 加载当前层的KV缓存基地址
             kvcache_ptr = tl.load(kv_cache_ptrs_ptr + ptr_idx).to(tl.pointer_type(DTYPE))
@@ -89,8 +91,20 @@ def kv_cache_batch_gather_kernel(
                 )
 
                 # 从HBM的KV缓存加载数据
-                # 计算源指针: [BLOCK_SIZE]
-                src_ptrs = kvcache_ptr + global_token_idx * NUM_DIMS_PER_TOKEN + dim_idx_in_token
+                if IS_PAGED:
+                    # Paged layout: [num_blocks, 2, page_size, num_heads, head_dim]
+                    # K和V交错在同一个buffer中，K在偶数位置，V在奇数位置
+                    page_id = global_token_idx // PAGE_SIZE
+                    token_in_page = global_token_idx % PAGE_SIZE
+                    # K在位置 [page_id, 0, token_in_page, ...], V在 [page_id, 1, token_in_page, ...]
+                    base_offset = page_id * (2 * PAGE_SIZE * NUM_DIMS_PER_TOKEN) + token_in_page * NUM_DIMS_PER_TOKEN
+                    # ptr_idx的奇偶性决定是K还是V
+                    kv_offset = base_offset + (ptr_idx % 2) * (PAGE_SIZE * NUM_DIMS_PER_TOKEN)
+                    src_ptrs = kvcache_ptr + kv_offset + dim_idx_in_token
+                else:
+                    # 传统layout: K和V分离
+                    src_ptrs = kvcache_ptr + global_token_idx * NUM_DIMS_PER_TOKEN + dim_idx_in_token
+
                 load_mask = mask & token_gather_mask
                 data = tl.load(src_ptrs, mask=load_mask, other=0.0)
                 # 大块连续写入 host memory (PCIe优化)
@@ -99,7 +113,7 @@ def kv_cache_batch_gather_kernel(
 
 
 def batch_gather_kv_caches(
-        # List of KV cache tensors ptr (each shape [2, total_token_in_kvcache, hidden_size])
+        # List of KV cache tensors ptr (each layer one pointer, K/V interleaved)
         kv_caches_ptrs_tensor: torch.Tensor,
         # Shape [block_num, num_layers * kv_num, num_tokens_per_block, dim_size_per_token_per_layer]
         dst_tensor: torch.Tensor,
@@ -107,6 +121,8 @@ def batch_gather_kv_caches(
         dst_block_indices: List[int],  # List of dst block indices
         num_tokens_per_block: int,
         dim_size_per_token_per_layer: int,
+        page_size: int = 0,  # paged layout的page size (tokens per page)
+        is_paged: bool = False,  # 是否使用paged layout
         sm_count: int = 3
 ):
     # 配置参数
@@ -130,6 +146,8 @@ def batch_gather_kv_caches(
         NUM_DIMS_PER_TOKEN=dim_size_per_token_per_layer,
         NUM_KVCACHE_PTRS=total_kv_caches_ptr,
         BLOCK_SIZE=2048,
+        PAGE_SIZE=page_size,
+        IS_PAGED=is_paged,
         DTYPE=pytorch_dtype_to_triton_dtype(dst_tensor.dtype),
         num_warps=32,
     )
@@ -138,15 +156,17 @@ def batch_gather_kv_caches(
 
 @triton.jit
 def kv_cache_batch_scatter_kernel(
-        kv_cache_ptrs_ptr,  # 指针数组基址 [num_layers * kv_count]
+        kv_cache_ptrs_ptr,  # 指针数组基址 [num_layers]
         src_ptr,  # 源缓冲区 (pinned host memory)
         block_token_indices_ptr,  # [total_blocks, num_tokens_per_block]
         src_block_indices_ptr,  # [total_blocks]
         total_blocks: int,  # 需要处理的总block数
         NUM_TOKENS_PER_BLOCK: tl.constexpr,
         NUM_DIMS_PER_TOKEN: tl.constexpr,
-        NUM_KVCACHE_PTRS: tl.constexpr,  # num_layers * kv_count
+        NUM_KVCACHE_PTRS: tl.constexpr,  # num_layers
         BLOCK_SIZE: tl.constexpr,  # 隐藏维度分块大小
+        PAGE_SIZE: tl.constexpr = 0,  # paged layout的page size (tokens per page)
+        IS_PAGED: tl.constexpr = False,  # 是否使用paged layout
         DTYPE: tl.constexpr = tl.float16,
 ):
     NUM_DIMS_PER_BLOCK = NUM_TOKENS_PER_BLOCK * NUM_DIMS_PER_TOKEN
@@ -167,7 +187,7 @@ def kv_cache_batch_scatter_kernel(
                 * NUM_DIMS_PER_TOKEN
         )
 
-        # 3. 遍历所有KV缓存指针 (k/v for each layer)
+        # 3. 遍历所有KV缓存指针 (每个layer一个指针，K/V交错在同一个buffer中)
         for ptr_idx in range(NUM_KVCACHE_PTRS):
             # 3.1 加载当前层的KV缓存基地址
             kvcache_ptr = tl.load(kv_cache_ptrs_ptr + ptr_idx).to(tl.pointer_type(DTYPE))
@@ -200,13 +220,22 @@ def kv_cache_batch_scatter_kernel(
                 data = tl.load(new_src_ptrs, mask=load_mask, other=0.0)
 
                 # 向HBM的KV缓存写入数据
-                # 计算目的指针: [BLOCK_SIZE]
-                dst_ptrs = kvcache_ptr + global_token_idx * NUM_DIMS_PER_TOKEN + dim_idx_in_token
+                if IS_PAGED:
+                    # Paged layout: [num_blocks, 2, page_size, num_heads, head_dim]
+                    # K和V交错在同一个buffer中
+                    page_id = global_token_idx // PAGE_SIZE
+                    token_in_page = global_token_idx % PAGE_SIZE
+                    base_offset = page_id * (2 * PAGE_SIZE * NUM_DIMS_PER_TOKEN) + token_in_page * NUM_DIMS_PER_TOKEN
+                    kv_offset = base_offset + (ptr_idx % 2) * (PAGE_SIZE * NUM_DIMS_PER_TOKEN)
+                    dst_ptrs = kvcache_ptr + kv_offset + dim_idx_in_token
+                else:
+                    # 传统layout: K和V分离
+                    dst_ptrs = kvcache_ptr + global_token_idx * NUM_DIMS_PER_TOKEN + dim_idx_in_token
                 tl.store(dst_ptrs, data, mask=load_mask)
 
 
 def batch_scatter_kv_caches(
-        # List of KV cache tensors ptr (each shape [2, total_token_in_kvcache, hidden_size])
+        # List of KV cache tensors ptr (each layer one pointer, K/V interleaved)
         kv_caches_ptrs_tensor: torch.Tensor,
         # Shape [block_num, num_layers * kv_num, num_tokens_per_block, dim_size_per_token_per_layer]
         src_tensor: torch.Tensor,  # 注意：src_tensor在PCIE连接的host DRAM上 (pinned memory)
@@ -214,6 +243,8 @@ def batch_scatter_kv_caches(
         src_block_indices: List[int],  # List of src block indices
         num_tokens_per_block: int,
         dim_size_per_token_per_layer: int,
+        page_size: int = 0,  # paged layout的page size (tokens per page)
+        is_paged: bool = False,  # 是否使用paged layout
         sm_count: int = 3
 ):
     # 配置参数
@@ -243,6 +274,8 @@ def batch_scatter_kv_caches(
         NUM_DIMS_PER_TOKEN=dim_size_per_token_per_layer,
         NUM_KVCACHE_PTRS=total_kv_caches_ptr,
         BLOCK_SIZE=2048,
+        PAGE_SIZE=page_size,
+        IS_PAGED=is_paged,
         DTYPE=pytorch_dtype_to_triton_dtype(src_tensor.dtype),
         num_warps=32,
     )

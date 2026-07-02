@@ -166,7 +166,9 @@ class DataTransferManager:
             remote_uris: 远程URI列表
             block_token_indices: 块令牌索引列表
         """
-        logger.debug("load remote_uris:%s, block_token_indices:%s", remote_uris, block_token_indices)
+        logger.warning("load task_idx=%d, remote_uris=%s, block_token_indices=%s, is_paged=%s, page_size=%d", 
+                      task_idx, remote_uris, block_token_indices,
+                      self._kvcache_info.is_paged, self._kvcache_info.page_size)
 
         copy_buffer_indices = self._copy_buffer_allocator.alloc_buffer_idx_blocking(len(remote_uris))
         copy_buffers = self._copy_buffer_allocator.get_buffer_by_idx(copy_buffer_indices)
@@ -199,6 +201,8 @@ class DataTransferManager:
                         copy_buffer_indices,
                         self._manager_block_size,
                         self._kvcache_info.per_token_per_layer_dim_size,
+                        page_size=self._kvcache_info.page_size,
+                        is_paged=self._kvcache_info.is_paged,
                     )
                     # Sync contiguous → strided for hybrid models (after Triton scatter)
                     self._post_scatter_sync()
@@ -207,7 +211,14 @@ class DataTransferManager:
                     copy_done_event.record(self._transfer_stream)
             copy_done_event.synchronize()
 
-            logger.debug("done scatter")
+            logger.warning("load done scatter, task_idx=%d", task_idx)
+            
+            # Checksum for debugging - use URI as key
+            if len(copy_buffers) > 0 and len(remote_uris) > 0:
+                first_buf = copy_buffers[0]
+                checksum = first_buf[:100].sum().item()
+                uri = remote_uris[0].split('?')[0]  # Remove query params
+                logger.warning("LOAD_CHECKSUM uri=%s checksum=%.4f", uri, checksum)
         else:
             logger.warning("load task failed, remote_uris:%s, block_token_indices:%s, transfer_result:%s",
                            remote_uris,
@@ -271,7 +282,9 @@ class DataTransferManager:
             block_token_indices: 块令牌索引列表
             kvcache_ready_event: KV缓存就绪事件
         """
-        logger.debug("save remote_uris:%s, block_token_indices:%s", remote_uris, block_token_indices)
+        logger.warning("save task_idx=%d, remote_uris=%s, block_token_indices=%s, is_paged=%s, page_size=%d", 
+                      task_idx, remote_uris, block_token_indices, 
+                      self._kvcache_info.is_paged, self._kvcache_info.page_size)
 
         with self._device_mod.stream(self._transfer_stream):
             kvcache_ready_event.wait()
@@ -289,13 +302,23 @@ class DataTransferManager:
                     copy_buffer_indices,
                     self._manager_block_size,
                     self._kvcache_info.per_token_per_layer_dim_size,
+                    page_size=self._kvcache_info.page_size,
+                    is_paged=self._kvcache_info.is_paged,
                 )
                 copy_done_event = self._device_mod.Event()
                 copy_done_event.record(self._transfer_stream)
 
         copy_done_event.synchronize()
 
-        logger.debug("done gather")
+        logger.warning("save done gather, task_idx=%d", task_idx)
+        
+        # Checksum for debugging - use URI as key
+        copy_buffers = self._copy_buffer_allocator.get_buffer_by_idx(copy_buffer_indices)
+        if len(copy_buffers) > 0 and len(remote_uris) > 0:
+            first_buf = copy_buffers[0]
+            checksum = first_buf[:100].sum().item()
+            uri = remote_uris[0].split('?')[0]  # Remove query params
+            logger.warning("SAVE_CHECKSUM uri=%s checksum=%.4f", uri, checksum)
 
         copy_buffers = self._copy_buffer_allocator.get_buffer_by_idx(copy_buffer_indices)
         buffers = []

@@ -659,6 +659,18 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._per_manager_location_spec_byte_size = math.prod(
             self._per_manager_location_spec_shape) * self._dtype.itemsize
 
+        # ── Detect paged layout ──
+        # vLLM v0.23 FlashAttention uses shape: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+        # K and V are interleaved within each block (K at index 0, V at index 1 in dim 1).
+        # This is different from older layout [2, num_blocks, block_size, heads, dim]
+        # where K and V are separate contiguous regions.
+        first_shape = first_cache.shape
+        self._is_paged = (len(first_shape) == 5 and first_shape[1] == 2)
+        self._page_size = first_shape[2] if self._is_paged else 0
+
+        logger.warning("KV cache layout: shape=%s, is_paged=%s, page_size=%d",
+                      first_shape, self._is_paged, self._page_size)
+
         # ── Build pointer tensors from working caches (contiguous copies for strided) ──
         self._kvcache_ptr_tensor_cpu = torch.tensor(
             [working_caches[name].data_ptr() for name in attn_layer_names],
@@ -671,7 +683,22 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 [working_caches[name].data_ptr() for name in attn_layer_names],
                 dtype=torch.int64, device="cpu",
             )
+        elif self._is_paged:
+            # Paged layout: K and V interleaved within each block [num_blocks, 2, page_size, heads, dim]
+            # Pass 2 pointers per layer (K base, V base) — both point to the same storage base.
+            # The kernel uses ptr_idx % 2 for K/V selection and ptr_idx // 2 for layer selection.
+            kvcache_ptrs = []
+            for name in attn_layer_names:
+                base_ptr = working_caches[name].data_ptr()
+                kvcache_ptrs.append(base_ptr)  # K base
+                kvcache_ptrs.append(base_ptr)  # V base (same storage, kernel handles offset)
+            self._all_kvcache_ptr_tensor_cpu = torch.tensor(
+                kvcache_ptrs, dtype=torch.int64, device="cpu",
+            )
+            logger.warning("Paged pointer tensor: %d pointers (2 per layer), first 4: %s",
+                          len(kvcache_ptrs), kvcache_ptrs[:4])
         else:
+            # Legacy layout: K and V are separate contiguous regions
             kvcache_ptrs = []
             for name in attn_layer_names:
                 kvcache_ptrs.append(working_caches[name][0].data_ptr())  # K base
@@ -753,7 +780,9 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._per_layer_token_key_dim_size,
             self._device,
             self._dtype,
-            hybrid_info,
+            page_size=getattr(self, '_page_size', 0),
+            is_paged=getattr(self, '_is_paged', False),
+            hybrid_info=hybrid_info,
             attn_contiguous_buffers=self._attn_contiguous_buffers,
             attn_strided_tensors=self._attn_strided_tensors,
             has_strided_attn=self._attn_strided_tensors is not None,

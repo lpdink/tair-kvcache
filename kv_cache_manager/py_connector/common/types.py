@@ -35,6 +35,13 @@ class KVCacheInfo:
     per_token_per_layer_dim_size: int
     device: torch.device
     dtype: torch.dtype
+    # Paged layout support for vLLM v0.23+
+    # vLLM v0.23 uses paged layout [num_blocks, 2, page_size, num_heads, head_dim]
+    # where K and V are interleaved within each block.
+    # page_size: number of tokens per page (block_size from tensor shape)
+    # is_paged: whether the KV cache uses paged layout
+    page_size: int = 0
+    is_paged: bool = False
     # Hybrid (mamba/gdn/linear) layer info, None for pure attention models
     hybrid_info: Optional[HybridCacheInfo] = None
     # Strided attention tensor support (for hybrid models with HMA).
