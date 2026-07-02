@@ -610,13 +610,34 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             working_caches = self._kv_caches
             first_cache = first_layer_kvcache
 
-        # ── Extract block_size from tensor shape ──
-        # The tensor shape is determined by the attention backend's get_kv_cache_shape().
-        # For FlashAttention: (num_blocks, 2, block_size, num_kv_heads, head_dim)
+        # ── Detect KV cache layout version ──
+        # vLLM changed the FlashAttention KV cache shape across versions:
+        #   v0.22.x: (2, num_blocks, block_size, num_kv_heads, head_dim)  — K/V in dim 0
+        #   v0.23+:  (num_blocks, 2, block_size, num_kv_heads, head_dim)  — K/V in dim 1
+        # The K/V dimension is always size 2; the num_blocks dimension is large.
+        # See: https://github.com/vllm-project/vllm/pull/42095
+        first_shape = first_cache.shape
+        assert len(first_shape) == 5, f"Expected 5D KV cache tensor, got shape {first_shape}"
+
+        if first_shape[0] == 2 and first_shape[1] != 2:
+            self._kv_layout = "v022"  # (2, num_blocks, block_size, H, D)
+            kv_dim, block_dim = 0, 1
+        elif first_shape[1] == 2 and first_shape[0] != 2:
+            self._kv_layout = "v023"  # (num_blocks, 2, block_size, H, D)
+            kv_dim, block_dim = 1, 0
+        else:
+            raise ValueError(
+                f"Ambiguous KV cache shape {first_shape}: cannot determine "
+                f"which dim is K/V (size 2) vs num_blocks. "
+                f"Expected v0.22 (2,B,N,H,D) or v0.23 (B,2,N,H,D)."
+            )
+
+        # ── Extract dimensions using detected layout ──
         # config.block_size may differ (e.g. 528 for hybrid alignment),
         # but the actual tensor uses kernel_block_size (e.g. 16).
-        self._local_block_size = first_cache.shape[2]
-        self._local_block_num = first_cache.shape[0]
+        # Token positions are always in dim 2 for both layouts.
+        self._local_block_size = first_shape[2]
+        self._local_block_num = first_shape[block_dim]
         self._local_token_num = self._local_block_num * self._local_block_size
 
         self._dtype = first_cache.dtype
@@ -626,12 +647,11 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._load_stream = self._device_mod.Stream()
 
         # ── Compute per-layer dimensions ──
-        # Shape: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-        # shape[3] = num_kv_heads, shape[4] = head_dim
-        self._per_layer_token_key_dim_size = first_cache.shape[3] * first_cache.shape[4]
+        # shape[3] = num_kv_heads, shape[4] = head_dim (same for both layouts)
+        self._per_layer_token_key_dim_size = first_shape[3] * first_shape[4]
         self._per_layer_token_key_byte_size = self._per_layer_token_key_dim_size * self._dtype.itemsize
         self._per_manager_location_spec_layer_shape = [
-            first_cache.shape[1],  # 2 (K and V)
+            first_shape[kv_dim],  # 2 (K and V)
             self._manager_block_size,
             self._per_layer_token_key_dim_size,
         ]
@@ -639,15 +659,16 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._per_manager_location_spec_layer_shape) * self._dtype.itemsize
 
         # ── Stride validation ──
-        # Verify adjacent tokens are separated by exactly per_layer_token_key_byte_size.
-        # This guards against incorrect shape interpretation.
+        # Verify adjacent tokens (dim 2) are separated by exactly per_layer_token_key_byte_size.
+        # Token positions are at dim 2 in both v0.22 and v0.23 layouts,
+        # so [0][0][1] - [0][0][0] gives the token stride in both cases.
         actual_token_stride = (
             first_cache[0][0][1].data_ptr() - first_cache[0][0][0].data_ptr()
         )
         assert actual_token_stride == self._per_layer_token_key_byte_size, (
             f"Token stride mismatch: expected {self._per_layer_token_key_byte_size}, "
             f"got {actual_token_stride}. Shape={first_cache.shape}, "
-            f"strides={first_cache.stride()}"
+            f"strides={first_cache.stride()}, layout={self._kv_layout}"
         )
         assert self._per_manager_location_spec_layer_byte_size == (
             2 * self._manager_block_size * self._per_layer_token_key_byte_size
@@ -660,16 +681,15 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             self._per_manager_location_spec_shape) * self._dtype.itemsize
 
         # ── Detect paged layout ──
-        # vLLM v0.23 FlashAttention uses shape: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-        # K and V are interleaved within each block (K at index 0, V at index 1 in dim 1).
-        # This is different from older layout [2, num_blocks, block_size, heads, dim]
-        # where K and V are separate contiguous regions.
-        first_shape = first_cache.shape
-        self._is_paged = (len(first_shape) == 5 and first_shape[1] == 2)
+        # v0.23: (num_blocks, 2, block_size, H, D) — K/V interleaved per block, kernel
+        #   needs special offset calculation via IS_PAGED=True.
+        # v0.22: (2, num_blocks, block_size, H, D) — K/V are separate contiguous regions,
+        #   kernel uses IS_PAGED=False with separate K/V base pointers.
+        self._is_paged = (self._kv_layout == "v023")
         self._page_size = first_shape[2] if self._is_paged else 0
 
-        logger.warning("KV cache layout: shape=%s, is_paged=%s, page_size=%d",
-                      first_shape, self._is_paged, self._page_size)
+        logger.warning("KV cache layout: shape=%s, version=%s, is_paged=%s, page_size=%d",
+                      first_shape, self._kv_layout, self._is_paged, self._page_size)
 
         # ── Build pointer tensors from working caches (contiguous copies for strided) ──
         self._kvcache_ptr_tensor_cpu = torch.tensor(
