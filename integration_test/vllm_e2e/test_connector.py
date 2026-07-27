@@ -83,8 +83,8 @@ class VerifyingConnector(TairKvCacheConnector):
 
         orig_factory = self._data_transfer.create_load_done_callback
 
-        def tracking_factory(req_id, tp_rank, epoch, local_block_ids):
-            orig_cb = orig_factory(req_id, tp_rank, epoch, local_block_ids)
+        def tracking_factory(req_id, *args, **kwargs):
+            orig_cb = orig_factory(req_id, *args, **kwargs)
             evt = threading.Event()
             with self._load_events_lock:
                 self._load_done_events.setdefault(req_id, []).append(evt)
