@@ -17,6 +17,9 @@ def kv_cache_scatter_kernel(
         hidden_size,  # hidden dimension size
         total_token_in_kvcache,  # sequence length in KV cache
         num_layers,  # number of layers
+        kv_stride,  # stride between K and V sections (in elements)
+        block_stride,  # stride between blocks (in elements)
+        local_block_size,  # tokens per block
         BLOCK_SIZE: tl.constexpr,
 ):
     # Get the current program's layer index and token position
@@ -41,9 +44,14 @@ def kv_cache_scatter_kernel(
     source_offset_k = (layer_idx * num_tokens_in_block * 2 + 0 * num_tokens_in_block + token_pos) * hidden_size
     source_offset_v = (1 * num_tokens_in_block + layer_idx * num_tokens_in_block * 2 + token_pos) * hidden_size
 
-    # Calculate target offsets (for both K and V)
-    target_offset_k = (0 * total_token_in_kvcache + token_idx) * hidden_size
-    target_offset_v = (1 * total_token_in_kvcache + token_idx) * hidden_size
+    # Calculate target offsets using stride-based addressing
+    # For contiguous layout: kv_stride = total_tokens * hidden_size, block_stride = block_size * hidden_size
+    # For strided layout: kv_stride and block_stride from tensor strides
+    block_idx = token_idx // local_block_size
+    token_in_block = token_idx % local_block_size
+    target_offset_k = block_idx * block_stride + token_in_block * hidden_size
+    target_offset_v = kv_stride + block_idx * block_stride + token_in_block * hidden_size
+    
     # Copy data in blocks
     for i in range(0, hidden_size, BLOCK_SIZE):
         offset = i + tl.arange(0, BLOCK_SIZE)
@@ -68,6 +76,9 @@ def kv_cache_gather_kernel(
         hidden_size,  # hidden dimension size
         total_token_in_kvcache,  # sequence length in KV cache
         num_layers,  # number of layers
+        kv_stride,  # stride between K and V sections (in elements)
+        block_stride,  # stride between blocks (in elements)
+        local_block_size,  # tokens per block
         BLOCK_SIZE: tl.constexpr,
 ):
     # Get the current program's layer index and token position
@@ -92,9 +103,12 @@ def kv_cache_gather_kernel(
     dst_offset_k = (layer_idx * num_tokens_in_block * 2 + 0 * num_tokens_in_block + token_pos) * hidden_size
     dst_offset_v = (layer_idx * num_tokens_in_block * 2 + 1 * num_tokens_in_block + token_pos) * hidden_size
 
-    # Calculate kvcache offsets (for both K and V)
-    kvcache_offset_k = (0 * total_token_in_kvcache + token_idx) * hidden_size
-    kvcache_offset_v = (1 * total_token_in_kvcache + token_idx) * hidden_size
+    # Calculate kvcache offsets using stride-based addressing
+    block_idx = token_idx // local_block_size
+    token_in_block = token_idx % local_block_size
+    kvcache_offset_k = block_idx * block_stride + token_in_block * hidden_size
+    kvcache_offset_v = kv_stride + block_idx * block_stride + token_in_block * hidden_size
+    
     # Copy data in blocks
     for i in range(0, hidden_size, BLOCK_SIZE):
         offset = i + tl.arange(0, BLOCK_SIZE)
@@ -113,6 +127,9 @@ def scatter_kv_caches(
         total_token_in_kvcache: int,  # total token in kv cache
         src_tensor: torch.Tensor,  # Shape [num_layers, 2, num_tokens_in_block, hidden_size]
         token_indices: List[int],  # List of token positions to update
+        kv_stride: int = 0,  # stride between K and V sections (in elements)
+        block_stride: int = 0,  # stride between blocks (in elements)
+        local_block_size: int = 0,  # tokens per block (0 = use total_token_in_kvcache)
 ):
     assert len(kv_caches_ptrs) == src_tensor.shape[0], "Number of layers mismatch"
     num_layers = len(kv_caches_ptrs)
@@ -126,6 +143,9 @@ def scatter_kv_caches(
     # Calculate grid size
     grid = (num_layers, num_tokens_in_block)
 
+    # Default local_block_size to total_token_in_kvcache if not provided
+    effective_local_block_size = local_block_size if local_block_size > 0 else total_token_in_kvcache
+
     # Launch kernel
     BLOCK_SIZE = 128  # Tunable parameter
     kv_cache_scatter_kernel[grid](
@@ -136,6 +156,9 @@ def scatter_kv_caches(
         hidden_size,
         total_token_in_kvcache,
         num_layers,
+        kv_stride,
+        block_stride,
+        effective_local_block_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
@@ -146,6 +169,9 @@ def gather_kv_caches(
         total_token_in_kvcache: int,  # total token in kv cache
         dst_tensor: torch.Tensor,  # Shape [num_layers, 2, num_tokens_in_block, hidden_size]
         token_indices: List[int],  # List of token positions to update
+        kv_stride: int = 0,  # stride between K and V sections (in elements)
+        block_stride: int = 0,  # stride between blocks (in elements)
+        local_block_size: int = 0,  # tokens per block (0 = use total_token_in_kvcache)
 ):
     assert kv_caches_ptrs.shape[0] == dst_tensor.shape[0], "Number of layers mismatch"
     num_layers = kv_caches_ptrs.shape[0]
@@ -158,6 +184,9 @@ def gather_kv_caches(
     # Calculate grid size
     grid = (num_layers, num_tokens_in_block)
 
+    # Default local_block_size to total_token_in_kvcache if not provided
+    effective_local_block_size = local_block_size if local_block_size > 0 else total_token_in_kvcache
+
     # Launch kernel
     BLOCK_SIZE = 128  # Tunable parameter
     kv_cache_gather_kernel[grid](
@@ -168,6 +197,9 @@ def gather_kv_caches(
         hidden_size,
         total_token_in_kvcache,
         num_layers,
+        kv_stride,
+        block_stride,
+        effective_local_block_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
