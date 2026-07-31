@@ -236,18 +236,19 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
         KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // SplitByPath 按 path 分组后组间顺序是无序的，但每个 block 的实际写入位置就是其输入 URI
+    // 指定的位置（Alloc 只创建文件，DoPut 按 URI 的 path/blkid 落盘），因此全部写入成功后
+    // 直接按输入顺序回填，保证 actual_remote_uris[i] 与 remote_uris[i] 对应（见 SdkInterface::Put 契约）
     auto group_map = SplitByPath(remote_uris, local_buffers);
     for (const auto &group : group_map) {
-        std::string file_path = group.first;
+        const std::string &file_path = group.first;
         if (!std::filesystem::exists(file_path)) {
-            auto ec = Alloc(group.second.remote_uris, *actual_remote_uris);
+            std::vector<DataStorageUri> alloc_uris;
+            auto ec = Alloc(group.second.remote_uris, alloc_uris);
             if (ec != ER_OK) {
                 KVCM_LOG_ERROR("Put failed, alloc failed, errorcode: %d", ec);
                 return ER_SDKALLOC_ERROR;
             }
-        } else {
-            actual_remote_uris->insert(
-                actual_remote_uris->end(), group.second.remote_uris.begin(), group.second.remote_uris.end());
         }
         auto ec = DoPut(group.second.remote_uris, group.second.local_buffers);
         if (ec != ER_OK) {
@@ -255,6 +256,7 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
             return ER_SDKWRITE_ERROR;
         }
     }
+    actual_remote_uris->assign(remote_uris.begin(), remote_uris.end());
     return ER_OK;
 }
 

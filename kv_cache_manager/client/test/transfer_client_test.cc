@@ -319,3 +319,51 @@ TEST_F(TransferClientMultiStorageTest, TestSaveAndLoadMixedStorage) {
     // Load
     EXPECT_EQ(ER_OK, client->LoadKvCaches(actual_uris, block_buffers));
 }
+
+TEST_F(TransferClientMultiStorageTest, TestSaveLoadInterleavedPathsAndPayloads) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+
+    // nfs_a/path1, nfs_b/pathX, nfs_a/path2, ...：同 backend 多 path 且同 path 不连续，
+    // 回归 SDK 内部按 path 分组导致返回 URI 乱序的缺陷
+    UriStrVec uri_str_vec = {
+        "file://nfs_a/" + root_path_ + "tmp/nfs_a/path1?blkid=0&size=1024",
+        "file://nfs_b/" + root_path_ + "tmp/nfs_b/pathX?blkid=0&size=1024",
+        "file://nfs_a/" + root_path_ + "tmp/nfs_a/path2?blkid=0&size=1024",
+        "file://nfs_b/" + root_path_ + "tmp/nfs_b/pathY?blkid=0&size=1024",
+        "file://nfs_a/" + root_path_ + "tmp/nfs_a/path3?blkid=0&size=1024",
+    };
+
+    // 每个 block 使用不同 payload，URI 乱序时读回必然错位
+    std::vector<std::string> payloads = {
+        "payload-nfs_a-path1",
+        "payload-nfs_b-pathX",
+        "payload-nfs_a-path2",
+        "payload-nfs_b-pathY",
+        "payload-nfs_a-path3",
+    };
+    BlockBuffers block_buffers(uri_str_vec.size());
+    for (size_t i = 0; i < uri_str_vec.size(); ++i) {
+        block_buffers[i].iovs.push_back(Iov{MemoryType::CPU, payloads[i].data(), payloads[i].size(), false});
+    }
+
+    auto [save_ec, actual_uris] = client->SaveKvCaches(uri_str_vec, block_buffers);
+    ASSERT_EQ(ER_OK, save_ec);
+    ASSERT_EQ(uri_str_vec.size(), actual_uris.size());
+    // 返回 URI 顺序与输入一致
+    for (size_t i = 0; i < uri_str_vec.size(); ++i) {
+        EXPECT_EQ(uri_str_vec[i], actual_uris[i]);
+    }
+
+    // 用返回的 URI 读回，各位置 payload 必须与同位置输入一致
+    BlockBuffers read_buffers(uri_str_vec.size());
+    std::vector<std::string> read_data(uri_str_vec.size());
+    for (size_t i = 0; i < uri_str_vec.size(); ++i) {
+        read_data[i].resize(payloads[i].size());
+        read_buffers[i].iovs.push_back(Iov{MemoryType::CPU, read_data[i].data(), read_data[i].size(), false});
+    }
+    ASSERT_EQ(ER_OK, client->LoadKvCaches(actual_uris, read_buffers));
+    for (size_t i = 0; i < uri_str_vec.size(); ++i) {
+        EXPECT_EQ(payloads[i], read_data[i]);
+    }
+}

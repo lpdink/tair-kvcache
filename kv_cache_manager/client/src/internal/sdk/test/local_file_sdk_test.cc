@@ -92,6 +92,60 @@ TEST_F(LocalFileSdkTest, TestPutGetWithCpu) {
     free(get_buffer);
 }
 
+TEST_F(LocalFileSdkTest, TestPutMultiPathInterleavedKeepsOrder) {
+    LocalFileSdk sdk;
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
+
+    // 同一次 Put 包含多个不同 path，且同 path 不连续出现：[a, b, a, c, b]
+    auto make_uri = [&](const std::string &file, uint64_t blkid) {
+        DataStorageUri uri("file://" + root_path_ + "/local_file/" + file);
+        uri.SetParam("blkid", std::to_string(blkid));
+        uri.SetParam("size", "1024");
+        return uri;
+    };
+    std::vector<DataStorageUri> remote_uris = {
+        make_uri("a.txt", 0),
+        make_uri("b.txt", 0),
+        make_uri("a.txt", 1),
+        make_uri("c.txt", 0),
+        make_uri("b.txt", 1),
+    };
+
+    // 每个 block 使用不同 payload，乱序回填时读回必然错位
+    std::vector<std::string> payloads = {
+        "payload-A0",
+        "payload-B0",
+        "payload-A1",
+        "payload-C0",
+        "payload-B1",
+    };
+    BlockBuffers put_buffers(remote_uris.size());
+    for (size_t i = 0; i < remote_uris.size(); ++i) {
+        put_buffers[i].iovs.push_back(Iov{MemoryType::CPU, payloads[i].data(), payloads[i].size(), false});
+    }
+
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, put_buffers, actual_remote_uris));
+
+    // 同序契约：actual_remote_uris[i] 必须与 remote_uris[i] 对应
+    ASSERT_EQ(actual_remote_uris->size(), remote_uris.size());
+    for (size_t i = 0; i < remote_uris.size(); ++i) {
+        ASSERT_EQ(actual_remote_uris->at(i).ToUriString(), remote_uris[i].ToUriString());
+    }
+
+    // 用返回的 URI 读回，各位置 payload 必须与同位置输入一致
+    BlockBuffers get_buffers(remote_uris.size());
+    std::vector<std::string> read_data(remote_uris.size());
+    for (size_t i = 0; i < remote_uris.size(); ++i) {
+        read_data[i].resize(payloads[i].size());
+        get_buffers[i].iovs.push_back(Iov{MemoryType::CPU, read_data[i].data(), read_data[i].size(), false});
+    }
+    ASSERT_EQ(ER_OK, sdk.Get(*actual_remote_uris, get_buffers));
+    for (size_t i = 0; i < remote_uris.size(); ++i) {
+        ASSERT_EQ(read_data[i], payloads[i]);
+    }
+}
+
 TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {
 #ifdef USING_CUDA
     LocalFileSdk sdk;

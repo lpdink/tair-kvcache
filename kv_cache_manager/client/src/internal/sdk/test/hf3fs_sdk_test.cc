@@ -486,6 +486,92 @@ TEST_F(Hf3fsSdkTest, PutBatch_ReturnOk_AllSuccess) {
     EXPECT_EQ(std::filesystem::file_size(uris[1].GetPath()), 2 * 4096 + size2);
 }
 
+TEST_F(Hf3fsSdkTest, PutBatch_ReturnOk_InterleavedPathsPreserveOrder) {
+    // 同一次 Put 包含多个不同 path，且同 path 不连续出现：[a, b, a]
+    auto base = std::filesystem::path(mount_point_) / ("put_batch_order_" + std::to_string(::getpid()));
+    DataStorageUri u1;
+    u1.SetPath((base / "a/x.bin").string());
+    u1.SetParam("blkid", "0");
+    u1.SetParam("size", "4096");
+
+    DataStorageUri u2;
+    u2.SetPath((base / "b/y.bin").string());
+    u2.SetParam("blkid", "0");
+    u2.SetParam("size", "4096");
+
+    DataStorageUri u3;
+    u3.SetPath((base / "a/z.bin").string());
+    u3.SetParam("blkid", "0");
+    u3.SetParam("size", "4096");
+
+    std::vector<DataStorageUri> uris{u1, u2, u3};
+
+    // 每个 block 使用不同 payload，乱序回填时读回必然错位
+    BlockBuffers bufs(3);
+    std::vector<std::shared_ptr<uint8_t>> data;
+    for (size_t i = 0; i < uris.size(); ++i) {
+        auto d = std::shared_ptr<uint8_t>((uint8_t *)malloc(16), [](void *ptr) { free(ptr); });
+        std::memset(d.get(), 'a' + i, 16);
+        data.push_back(d);
+        bufs[i].iovs.push_back(Iov{MemoryType::CPU, d.get(), 16, false});
+    }
+
+    auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
+    ASSERT_TRUE(mock != nullptr);
+    EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsDeregFd(::testing::_)).Times(::testing::AtLeast(0));
+    EXPECT_CALL(*mock,
+                Hf3fsIorCreate(::testing::NotNull(),
+                               ::testing::_,
+                               ::testing::_,
+                               ::testing::_,
+                               ::testing::_,
+                               ::testing::_,
+                               ::testing::_,
+                               ::testing::_))
+        .WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsIorDestroy(::testing::NotNull())).Times(::testing::AtLeast(0));
+    EXPECT_CALL(*mock,
+                Hf3fsPrepIo(::testing::_,
+                            ::testing::_,
+                            ::testing::_,
+                            ::testing::_,
+                            ::testing::_,
+                            ::testing::_,
+                            ::testing::_,
+                            ::testing::_))
+        .WillRepeatedly(::testing::Invoke([](const struct hf3fs_ior *ior,
+                                             const struct hf3fs_iov *iov,
+                                             bool read,
+                                             void *ptr,
+                                             int fd,
+                                             size_t off,
+                                             uint64_t len,
+                                             const void *userdata) {
+            lseek(fd, off, SEEK_SET);
+            return ::write(fd, ptr, len) == len ? 0 : -1;
+        }));
+    EXPECT_CALL(*mock, Hf3fsSubmitIos(::testing::_)).WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsWaitForIos(::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Invoke([](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int, const timespec *) {
+            for (int i = 0; i < cqec; ++i) {
+                cqes[i].result = 1;
+            }
+            return cqec;
+        }));
+
+    auto out = std::make_shared<std::vector<DataStorageUri>>();
+    auto rc = sdk_->Put(uris, bufs, out);
+    EXPECT_EQ(rc, ER_OK);
+    ASSERT_EQ(out->size(), uris.size());
+
+    // 同序契约：out[i] 与 uris[i] 对应
+    for (size_t i = 0; i < uris.size(); ++i) {
+        EXPECT_EQ(out->at(i).ToUriString(), uris[i].ToUriString());
+        EXPECT_TRUE(std::filesystem::exists(uris[i].GetPath()));
+    }
+}
+
 // ------------- Put (single) -------------
 TEST_F(Hf3fsSdkTest, Put_ReturnOk_EmptyIovs) {
     DataStorageUri uri;

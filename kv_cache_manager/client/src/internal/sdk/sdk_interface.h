@@ -20,9 +20,13 @@ public:
 
     virtual SdkType Type() = 0;
 
-    // 一个remote_uri和一个Blockbuffer对应一个block
+    // 一个remote_uri和一个Blockbuffer对应一个block：Get将remote_uris[i]读入local_buffers[i]，按位置一一对应。
     virtual ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) = 0;
-    // actual_remote_uris是实际存储的远端地址
+    // actual_remote_uris是实际存储的远端地址。
+    // 同序契约：返回ER_OK时，actual_remote_uris必须与remote_uris大小相同且按位置一一对应，
+    // 即actual_remote_uris[i]是remote_uris[i]/local_buffers[i]这个block实际写入的位置。
+    // 实现不得因内部分组、并发等因素打乱结果顺序；上层SdkWrapper::Put依赖该契约将各SDK
+    // 的返回值回填到原始请求位置。
     virtual ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                                 const BlockBuffers &local_buffers,
                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) = 0;
