@@ -245,7 +245,9 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
         return ER_THREADPOOL_ERROR;
     }
 
-    // Submit all tasks with shared stop flag
+    // Submit all tasks with shared stop flag.
+    // stop 只能拦截“尚未开始执行”的任务；已经进入 SDK 的 I/O 无法取消，由返回前的
+    // DrainRunningTasks 兜底等待其完成，保证返回后不再有后台线程访问调用方 buffer。
     auto stop = std::make_shared<std::atomic<bool>>(false);
     std::vector<std::future<ClientErrorCode>> futures;
     futures.reserve(tasks.size());
@@ -257,19 +259,12 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
             }
             return task();
         };
-        futures.push_back(wait_task_thread_pool_->async(wrapped));
+        futures.push_back(wait_task_thread_pool_->async(std::move(wrapped)));
     }
 
     // Wait with shared deadline
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
-    // Drain in-flight tasks with bounded wait to prevent background writes into caller's buffers
-    auto drain = [&](size_t from) {
-        stop->store(true);
-        for (size_t j = from; j < futures.size(); ++j) {
-            futures[j].wait_until(deadline);
-        }
-    };
+    ClientErrorCode result = ER_OK;
 
     for (size_t i = 0; i < futures.size(); ++i) {
         auto remaining = deadline - std::chrono::steady_clock::now();
@@ -283,18 +278,58 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                           timeout_ms,
                           i + 1,
                           futures.size());
-            drain(i + 1);
-            return ER_SDK_TIMEOUT;
+            result = ER_SDK_TIMEOUT;
+            break;
         }
 
         auto ec = futures[i].get();
         if (ec != ER_OK) {
-            drain(i + 1);
-            return ec;
+            // fail-fast：保留首个具体 SDK 错误码，不被 ER_SDK_TIMEOUT 覆盖
+            result = ec;
+            break;
         }
     }
 
-    return ER_OK;
+    // 无论成功/失败/超时，返回前必须确保没有任务还在读写调用方 buffer：
+    // 先置 stop 让队列中未开始的任务立即空转返回，再等待所有在途任务执行完成。
+    stop->store(true);
+    DrainRunningTasks(futures, op_type, deadline);
+    return result;
+}
+
+void SdkWrapper::DrainRunningTasks(std::vector<std::future<ClientErrorCode>> &futures,
+                                   OpType op_type,
+                                   std::chrono::steady_clock::time_point deadline) const {
+    // 僵死后端的 I/O 永不返回时，这里会一直等下去（见 Get/Put 的契约注释）；
+    // 按固定间隔打 WARN 日志，让“卡在 drain”与“正常收尾”在日志上可区分。
+    constexpr auto kStuckLogInterval = std::chrono::seconds(5);
+    for (size_t i = 0; i < futures.size(); ++i) {
+        if (!futures[i].valid()) {
+            continue; // 结果已通过 get() 收集，任务必然已结束
+        }
+        auto wait_begin = std::chrono::steady_clock::now();
+        while (futures[i].wait_for(kStuckLogInterval) != std::future_status::ready) {
+            auto overdue_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
+                    .count();
+            KVCM_LOG_WARN("run %s parallel: task %zu/%zu still in flight %lld ms past deadline, keep waiting for "
+                          "backend I/O to finish before returning (storage backend may be wedged)",
+                          getOpTypeString(op_type).c_str(),
+                          i + 1,
+                          futures.size(),
+                          static_cast<long long>(overdue_ms));
+        }
+        auto extra_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_begin)
+                .count();
+        if (extra_ms > 0) {
+            KVCM_LOG_INFO("run %s parallel: drained in-flight task %zu/%zu in %lld ms before returning",
+                          getOpTypeString(op_type).c_str(),
+                          i + 1,
+                          futures.size(),
+                          static_cast<long long>(extra_ms));
+        }
+    }
 }
 
 ClientErrorCode SdkWrapper::UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,

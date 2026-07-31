@@ -21,6 +21,8 @@ public:
     virtual SdkType Type() = 0;
 
     // 一个remote_uri和一个Blockbuffer对应一个block：Get将remote_uris[i]读入local_buffers[i]，按位置一一对应。
+    // 实现约束：Get/Put必须同步执行，返回后不得再持有或访问remote_uris、local_buffers
+    // 及其指向的任何调用方内存（SdkWrapper依赖该约束保证超时返回后调用方buffer的生命周期安全）。
     virtual ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) = 0;
     // actual_remote_uris是实际存储的远端地址。
     // 同序契约：返回ER_OK时，actual_remote_uris必须与remote_uris大小相同且按位置一一对应，
