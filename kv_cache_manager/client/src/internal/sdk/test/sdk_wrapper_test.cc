@@ -1,9 +1,18 @@
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
+#include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_io_stats.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
@@ -27,6 +36,9 @@ public:
     void TearDown() override {
         free(init_params_.regist_span->base);
         delete init_params_.regist_span;
+        // 隔离注入缝与统计计数，避免测试间相互影响。
+        SdkFactory::GetInstance()->ClearCustomCreatorsForTest();
+        SdkIoStats::Instance().Reset();
     }
 
 private:
@@ -359,4 +371,231 @@ TEST_F(SdkWrapperMultiStorageTest, TestGroupBySdk) {
     ASSERT_EQ(groups[1].indices[0], 1);
     ASSERT_EQ(groups[1].uris.size(), 1);
     ASSERT_EQ(groups[1].buffers.size(), 1);
+}
+
+// ============================================================================
+// W0：deadline 准入 / 超时有界返回 / deadline 传播 / F3 保序基础设施
+// ============================================================================
+
+// 可控 fake SDK：记录 Get/Put 调用，可注入延迟；Get 内部观测 SdkDeadline。
+struct FakeSdkControl {
+    std::atomic<int> get_call_count{0};
+    std::atomic<int> put_call_count{0};
+    std::atomic<int> get_delay_ms{0}; // Get 内的睡眠时长（模拟慢 I/O）
+    std::atomic<int> get_result{static_cast<int>(ER_OK)};
+    // Get 入口处对 SdkDeadline 的观测（TestDeadlinePropagation 用）
+    std::atomic<bool> deadline_has_value{false};
+    std::atomic<int64_t> deadline_remaining_ms{-1};
+};
+
+class FakeSdk : public SdkInterface {
+public:
+    explicit FakeSdk(std::shared_ptr<FakeSdkControl> ctrl) : ctrl_(std::move(ctrl)) {}
+
+    ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
+                         const std::shared_ptr<StorageConfig> &) override {
+        return ER_OK;
+    }
+    SdkType Type() override { return SdkType::LOCAL_FILE; }
+    ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &) override {
+        ctrl_->get_call_count.fetch_add(1);
+        ctrl_->deadline_has_value.store(SdkDeadline::Get().has_value());
+        ctrl_->deadline_remaining_ms.store(SdkDeadline::RemainingMs());
+        int delay_ms = ctrl_->get_delay_ms.load();
+        if (delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
+        return static_cast<ClientErrorCode>(ctrl_->get_result.load());
+    }
+    ClientErrorCode Put(const std::vector<DataStorageUri> &,
+                        const BlockBuffers &,
+                        std::shared_ptr<std::vector<DataStorageUri>>) override {
+        ctrl_->put_call_count.fetch_add(1);
+        return ER_OK;
+    }
+
+protected:
+    ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override {
+        return ER_OK;
+    }
+
+private:
+    std::shared_ptr<FakeSdkControl> ctrl_;
+};
+
+// 注册 NFS 类型的 fake creator；wrapper Init 时会命中注入缝并调用 FakeSdk::Init。
+void RegisterFakeSdkForTest(const std::shared_ptr<FakeSdkControl> &ctrl) {
+    SdkFactory::GetInstance()->RegisterCustomCreatorForTest(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        [ctrl](const std::shared_ptr<SdkBackendConfig> &, const std::shared_ptr<StorageConfig> &) {
+            return std::make_shared<FakeSdk>(ctrl);
+        });
+}
+
+// 轮询等待 SdkIoStats 中出现指定子串（准入拒绝发生在线程池任务里，与调用线程异步）。
+bool WaitForStatsSubstring(const std::string &substr, int max_retry = 300) {
+    for (int i = 0; i < max_retry; ++i) {
+        if (SdkIoStats::Instance().DebugString().find(substr) != std::string::npos) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+// 验证 00-context.md §6.1 的修复：排队超过 deadline 的任务不得再发起 I/O。
+// 方法：占满线程池（8 线程各睡 500ms），Get 的 timeout 设为 50ms →
+// 分组任务必然在队列里等过 deadline → 启动时被准入检查拦下。
+TEST_F(SdkWrapperTest, TestAdmissionRejectOnExpiredDeadline) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    RegisterFakeSdkForTest(ctrl);
+
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+
+    // 占满线程池的全部 8 个线程，每个睡眠 500ms。
+    std::vector<std::future<ClientErrorCode>> blockers;
+    for (size_t i = 0; i < 8; ++i) {
+        blockers.push_back(sdk_wrapper.wait_task_thread_pool_->async([]() -> ClientErrorCode {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            return ER_OK;
+        }));
+    }
+
+    // timeout 调小到 50ms：deadline 会在任务排队期间过期。
+    SdkTimeoutConfig timeout_config;
+    timeout_config.set_put_timeout_ms(2000);
+    timeout_config.set_get_timeout_ms(50);
+    client_config_->sdk_wrapper_config()->set_timeout_config(timeout_config);
+
+    std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("file://nfs_test/" + root_path_ + "/nfs/0/0/1?blkid=0&size=1024")};
+    BlockBuffers local_buffers = {BlockBuffer()};
+
+    auto start = std::chrono::steady_clock::now();
+    ClientErrorCode ec = sdk_wrapper.Get(remote_uris, local_buffers);
+    int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                             .count();
+
+    // 核心断言：fake SDK 的 Get 从未被调用（I/O 未发起），返回超时，且不等待在飞任务。
+    ASSERT_EQ(ER_SDK_TIMEOUT, ec);
+    ASSERT_EQ(0, ctrl->get_call_count.load());
+    ASSERT_LT(elapsed_ms, 400); // 占位任务要 500ms 才结束；若等待它们则此处必超
+
+    // 排队任务在 ~500ms 后才会被拾起并触发准入拒绝，轮询等待计数生效。
+    ASSERT_TRUE(WaitForStatsSubstring("admission_reject_count: local_file/get=1"));
+    ASSERT_TRUE(WaitForStatsSubstring("timeout_count: local_file/get=1"));
+
+    // 回收占位任务，避免线程池析构时等待未完成任务。
+    for (auto &f : blockers) {
+        f.get();
+    }
+}
+
+// 验证超时有界返回：fake SDK 睡 1500ms、timeout 200ms → wrapper 必须在远小于
+// fake 睡眠时长内返回（证明没有 drain / 等待 in-flight I/O 的阻塞）。
+TEST_F(SdkWrapperTest, TestNoUnboundedWaitOnTimeout) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    ctrl->get_delay_ms.store(1500);
+    RegisterFakeSdkForTest(ctrl);
+
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+
+    SdkTimeoutConfig timeout_config;
+    timeout_config.set_put_timeout_ms(2000);
+    timeout_config.set_get_timeout_ms(200);
+    client_config_->sdk_wrapper_config()->set_timeout_config(timeout_config);
+
+    std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("file://nfs_test/" + root_path_ + "/nfs/0/0/1?blkid=0&size=1024")};
+    BlockBuffers local_buffers = {BlockBuffer()};
+
+    auto start = std::chrono::steady_clock::now();
+    ClientErrorCode ec = sdk_wrapper.Get(remote_uris, local_buffers);
+    int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                             .count();
+
+    ASSERT_EQ(ER_SDK_TIMEOUT, ec);
+    ASSERT_LT(elapsed_ms, 1000); // 若有人改回"等 in-flight 完成"，此断言会立刻变红
+    // 超时计数在调用线程内联更新，返回时立即可见。
+    ASSERT_NE(SdkIoStats::Instance().DebugString().find("timeout_count: local_file/get=1"), std::string::npos);
+
+    // 等 fake 的睡眠结束，避免线程池/进程退出时任务仍在跑。
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+}
+
+// 验证 SdkDeadline 通过 thread_local + RAII 传播进 SDK 内部（W1/W2/W3 依赖此机制）。
+TEST_F(SdkWrapperTest, TestDeadlinePropagation) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    RegisterFakeSdkForTest(ctrl);
+
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+
+    // 默认配置 get_timeout_ms=2000。
+    std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("file://nfs_test/" + root_path_ + "/nfs/0/0/1?blkid=0&size=1024")};
+    BlockBuffers local_buffers = {BlockBuffer()};
+
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(remote_uris, local_buffers));
+
+    // fake 的 Get 在任务线程内执行，应能读到 wrapper 设置的 deadline。
+    ASSERT_EQ(1, ctrl->get_call_count.load());
+    ASSERT_TRUE(ctrl->deadline_has_value.load());
+    int64_t remaining_ms = ctrl->deadline_remaining_ms.load();
+    ASSERT_GT(remaining_ms, 0);
+    ASSERT_LE(remaining_ms, 2000);
+}
+
+// 用于直接调用受保护方法 SplitByPath 的最小实现。
+class TestSplitSdk : public SdkInterface {
+public:
+    ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
+                         const std::shared_ptr<StorageConfig> &) override {
+        return ER_OK;
+    }
+    SdkType Type() override { return SdkType::LOCAL_FILE; }
+    ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &) override { return ER_OK; }
+    ClientErrorCode Put(const std::vector<DataStorageUri> &,
+                        const BlockBuffers &,
+                        std::shared_ptr<std::vector<DataStorageUri>>) override {
+        return ER_OK;
+    }
+
+protected:
+    ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override {
+        return ER_OK;
+    }
+};
+
+// 验证 F3 保序基础设施：交错多 path 输入时，每组 indices 记录原始下标。
+TEST_F(SdkWrapperTest, TestSplitByPathRecordsIndices) {
+    TestSplitSdk sdk;
+    std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("file://nfs_test/shared?blkid=0&size=1024"),
+        DataStorageUri("file://nfs_test/other?blkid=0&size=1024"),
+        DataStorageUri("file://nfs_test/shared?blkid=1&size=1024"),
+        DataStorageUri("file://nfs_test/other?blkid=1&size=1024"),
+    };
+    BlockBuffers local_buffers = {BlockBuffer(), BlockBuffer(), BlockBuffer(), BlockBuffer()};
+
+    auto groups = sdk.SplitByPath(remote_uris, local_buffers);
+    ASSERT_EQ(groups.size(), 2);
+
+    const auto &shared = groups.at("/shared");
+    ASSERT_EQ(shared.indices.size(), 2);
+    ASSERT_EQ(shared.indices[0], 0);
+    ASSERT_EQ(shared.indices[1], 2);
+    ASSERT_EQ(shared.remote_uris.size(), 2);
+    ASSERT_EQ(shared.remote_uris[0].ToUriString(), remote_uris[0].ToUriString());
+    ASSERT_EQ(shared.remote_uris[1].ToUriString(), remote_uris[2].ToUriString());
+    ASSERT_EQ(shared.local_buffers.size(), 2);
+
+    const auto &other = groups.at("/other");
+    ASSERT_EQ(other.indices.size(), 2);
+    ASSERT_EQ(other.indices[0], 1);
+    ASSERT_EQ(other.indices[1], 3);
+    ASSERT_EQ(other.remote_uris[0].ToUriString(), remote_uris[1].ToUriString());
+    ASSERT_EQ(other.remote_uris[1].ToUriString(), remote_uris[3].ToUriString());
 }

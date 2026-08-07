@@ -5,6 +5,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_io_stats.h"
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
@@ -72,6 +73,11 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
 
+        // Init 级 timeout 透传：各 SDK 在 Init 时可读取 get/put_timeout_ms（统一入口）。
+        // 注意：PACE 等后端的 timeout 是进程级配置（如 TAIR_MEMPOOL_CLIENT_IO_TIMEOUT_MS），
+        // 此处仅是 kvcm 侧的统一入口；SDK 内部主要使用 SdkDeadline 做逐 block/逐 key 准入检查。
+        sdk_backend_config->set_timeout_config(wrapper_config_->timeout_config());
+
         auto sdk = sdk_factory_->CreateSdk(type, sdk_backend_config, storage_config);
         if (!sdk) {
             KVCM_LOG_WARN("create sdk failed, storage config: %s", storage_config->ToString().c_str());
@@ -122,15 +128,24 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, 
     }
 
     // Build task vector for parallel dispatch
-    std::vector<std::function<ClientErrorCode()>> tasks;
-    tasks.reserve(groups.size());
-    for (const auto &group : groups) {
-        // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group]() { return group.sdk->Get(group.uris, group.buffers); });
-    }
-
+    std::vector<TimedTask> timed_tasks;
+    timed_tasks.reserve(groups.size());
     int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
-    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms);
+    // deadline 在调用入口计算一次，向下传播（线程池准入检查 + SDK 内部逐 block 检查共用）。
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto &group = groups[i];
+        TimedTask task;
+        task.sdk_type = group.sdk->Type();
+        task.group_index = i + 1;
+        task.group_count = groups.size();
+        task.block_count = group.uris.size();
+        // Capture group by value to prevent use-after-free on timeout
+        task.fn = [group]() { return group.sdk->Get(group.uris, group.buffers); };
+        timed_tasks.push_back(std::move(task));
+    }
+    return RunWithTimeoutParallel(OpType::GET, std::move(timed_tasks), deadline, timeout_ms);
 }
 
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
@@ -149,22 +164,31 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     actual_remote_uris->resize(remote_uris.size());
 
     // Build task vector and result containers for parallel dispatch
-    std::vector<std::function<ClientErrorCode()>> tasks;
+    std::vector<TimedTask> timed_tasks;
     std::vector<std::shared_ptr<std::vector<DataStorageUri>>> group_results;
-    tasks.reserve(groups.size());
+    timed_tasks.reserve(groups.size());
     group_results.reserve(groups.size());
+    int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
+    // deadline 在调用入口计算一次，向下传播（线程池准入检查 + SDK 内部逐 block 检查共用）。
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
-    for (const auto &group : groups) {
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto &group = groups[i];
         auto group_actual_uris = std::make_shared<std::vector<DataStorageUri>>();
         group_results.push_back(group_actual_uris);
+        TimedTask task;
+        task.sdk_type = group.sdk->Type();
+        task.group_index = i + 1;
+        task.group_count = groups.size();
+        task.block_count = group.uris.size();
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group, group_actual_uris]() {
+        task.fn = [group, group_actual_uris]() {
             return group.sdk->Put(group.uris, group.buffers, group_actual_uris);
-        });
+        };
+        timed_tasks.push_back(std::move(task));
     }
 
-    int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
-    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), timeout_ms);
+    ec = RunWithTimeoutParallel(OpType::PUT, std::move(timed_tasks), deadline, timeout_ms);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, sdk error: %d", static_cast<int>(ec));
         return ec;
@@ -232,7 +256,8 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
 }
 
 ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
-                                                   std::vector<std::function<ClientErrorCode()>> &&tasks,
+                                                   std::vector<TimedTask> &&tasks,
+                                                   SdkDeadline::TimePoint deadline,
                                                    int timeout_ms) const {
     if (tasks.empty()) {
         return ER_OK;
@@ -245,51 +270,76 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
         return ER_THREADPOOL_ERROR;
     }
 
-    // Submit all tasks with shared stop flag
-    auto stop = std::make_shared<std::atomic<bool>>(false);
+    const bool is_get = (op_type == OpType::GET);
+    const std::string op_str = getOpTypeString(op_type);
+    // 调用入口时间 = deadline - timeout_ms，用于日志里的 elapsed_ms 归因。
+    auto start = deadline - std::chrono::milliseconds(timeout_ms);
+
     std::vector<std::future<ClientErrorCode>> futures;
     futures.reserve(tasks.size());
 
     for (auto &task : tasks) {
-        auto wrapped = [stop, task]() -> ClientErrorCode {
-            if (stop->load()) {
+        // 准入检查：任务真正开始执行时先看绝对 deadline。
+        // 这是本次修复的核心（00-context.md §6.1）：排队 14.9s 的任务过去会照样发起
+        // I/O，导致 caller 早已返回而 I/O 刚开始写它的 buffer。
+        // 权威依据只有 deadline；不再使用 stop flag（对未启动任务与 deadline 检查冗余，
+        // 对已启动任务无效），保持单一事实来源。
+        auto wrapped = [deadline, timeout_ms, op_str, is_get, task]() -> ClientErrorCode {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                auto overdue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - deadline)
+                                      .count();
+                SdkIoStats::Instance().OnAdmissionReject(task.sdk_type, is_get, overdue_ms);
+                KVCM_LOG_WARN("sdk admission reject: backend=%s op=%s timeout_ms=%d overdue_ms=%lld group=%zu/%zu "
+                              "blocks=%zu, deadline already passed, skip I/O to protect caller buffer",
+                              SdkTypeToString(task.sdk_type).c_str(),
+                              op_str.c_str(),
+                              timeout_ms,
+                              static_cast<long long>(overdue_ms),
+                              task.group_index,
+                              task.group_count,
+                              task.block_count);
                 return ER_SDK_TIMEOUT;
             }
-            return task();
+            // 把 deadline 传播给 SDK 内部（逐 block/逐 key 准入检查用，见 sdk_deadline.h）。
+            SdkDeadline::Scope scope(deadline);
+            return task.fn();
         };
-        futures.push_back(wait_task_thread_pool_->async(wrapped));
+        futures.push_back(wait_task_thread_pool_->async(std::move(wrapped)));
     }
 
-    // Wait with shared deadline
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
-    // Drain in-flight tasks with bounded wait to prevent background writes into caller's buffers
-    auto drain = [&](size_t from) {
-        stop->store(true);
-        for (size_t j = from; j < futures.size(); ++j) {
-            futures[j].wait_until(deadline);
-        }
-    };
-
+    // 等待：每个 future 用 wait_until(deadline)，超时即刻返回，不 drain、不等待 in-flight 任务。
+    // ⚠️ future 生命周期：autil::ThreadPoolBase::async 返回的是 std::packaged_task 的 future
+    //    （promise-backed），其析构不阻塞（只有 std::async 启动的 future 析构才可能阻塞）。
+    //    因此超时后直接放弃未完成的 future 是安全的，调用线程不会被 in-flight I/O 拖住。
     for (size_t i = 0; i < futures.size(); ++i) {
-        auto remaining = deadline - std::chrono::steady_clock::now();
-        if (remaining <= std::chrono::steady_clock::duration::zero()) {
-            remaining = std::chrono::steady_clock::duration::zero();
-        }
-
-        if (futures[i].wait_for(remaining) != std::future_status::ready) {
-            KVCM_LOG_WARN("run %s parallel but timeout: %d ms (group %zu/%zu)",
-                          getOpTypeString(op_type).c_str(),
+        if (futures[i].wait_until(deadline) != std::future_status::ready) {
+            const auto &task = tasks[i];
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+            SdkIoStats::Instance().OnTimeout(task.sdk_type, is_get, elapsed_ms, /*done=*/i, tasks.size());
+            KVCM_LOG_WARN("run %s parallel timeout: backend=%s op=%s timeout_ms=%d elapsed_ms=%lld group=%zu/%zu "
+                          "blocks=%zu, return immediately without waiting in-flight I/O",
+                          op_str.c_str(),
+                          SdkTypeToString(task.sdk_type).c_str(),
+                          op_str.c_str(),
                           timeout_ms,
-                          i + 1,
-                          futures.size());
-            drain(i + 1);
+                          static_cast<long long>(elapsed_ms),
+                          task.group_index,
+                          task.group_count,
+                          task.block_count);
             return ER_SDK_TIMEOUT;
         }
 
         auto ec = futures[i].get();
         if (ec != ER_OK) {
-            drain(i + 1);
+            // 失败即刻返回；不等待其余 in-flight 任务（见 01-contract.md §2.1 否决项）。
+            KVCM_LOG_WARN("run %s parallel failed, sdk error: %d, group %zu/%zu",
+                          op_str.c_str(),
+                          static_cast<int>(ec),
+                          tasks[i].group_index,
+                          tasks[i].group_count);
             return ec;
         }
     }

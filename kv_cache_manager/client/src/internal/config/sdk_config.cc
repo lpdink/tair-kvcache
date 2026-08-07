@@ -30,6 +30,7 @@ bool SdkBackendConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "sdk_log_file_path", sdk_log_file_path_);
     KVCM_JSON_GET_MACRO(rapid_value, "sdk_log_level", sdk_log_level_);
     KVCM_JSON_GET_MACRO(rapid_value, "spec_byte_sizes_per_block", spec_byte_sizes_per_block_);
+    KVCM_JSON_GET_MACRO(rapid_value, "timeout_config", timeout_config_);
     return true;
 }
 
@@ -38,6 +39,7 @@ void SdkBackendConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> 
     Put(writer, "sdk_log_file_path", sdk_log_file_path_);
     Put(writer, "sdk_log_level", sdk_log_level_);
     Put(writer, "spec_byte_sizes_per_block", spec_byte_sizes_per_block_);
+    Put(writer, "timeout_config", timeout_config_);
 }
 
 bool SdkBackendConfig::Validate() const { return DataStorageType::DATA_STORAGE_TYPE_UNKNOWN != type_; }

@@ -19,6 +19,12 @@ SdkFactory *SdkFactory::GetInstance() {
     return &instance;
 }
 
+void SdkFactory::RegisterCustomCreatorForTest(DataStorageType type, SdkCreator creator) {
+    custom_creators_[type] = std::move(creator);
+}
+
+void SdkFactory::ClearCustomCreatorsForTest() { custom_creators_.clear(); }
+
 std::shared_ptr<SdkInterface> SdkFactory::CreateSdk(const DataStorageType &type,
                                                     const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                                     const std::shared_ptr<StorageConfig> &storage_config) {
@@ -27,31 +33,37 @@ std::shared_ptr<SdkInterface> SdkFactory::CreateSdk(const DataStorageType &type,
         return nullptr;
     }
     std::shared_ptr<SdkInterface> sdk;
-    switch (type) {
+    auto creator_it = custom_creators_.find(type);
+    if (creator_it != custom_creators_.end()) {
+        // test-only 注入缝：命中自定义 creator 时跳过默认 switch（仅测试使用）。
+        sdk = creator_it->second(sdk_backend_config, storage_config);
+    } else {
+        switch (type) {
 #ifdef ENABLE_HF3FS
-    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
-        sdk = std::make_shared<Hf3fsSdk>();
-        break;
-    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
-        sdk = std::make_shared<Hf3fsSdk>();
-        break;
+        case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+            sdk = std::make_shared<Hf3fsSdk>();
+            break;
+        case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+            sdk = std::make_shared<Hf3fsSdk>();
+            break;
 #endif
 #ifdef ENABLE_MOONCAKE
-    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
-        sdk = std::make_shared<MooncakeSdk>();
-        break;
+        case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
+            sdk = std::make_shared<MooncakeSdk>();
+            break;
 #endif
 #ifdef ENABLE_TAIR_MEMPOOL
-    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
-        sdk = std::make_shared<TairMempoolSdk>();
-        break;
+        case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+            sdk = std::make_shared<TairMempoolSdk>();
+            break;
 #endif
-    case DataStorageType::DATA_STORAGE_TYPE_NFS:
-        sdk = std::make_shared<LocalFileSdk>();
-        break;
-    default:
-        KVCM_LOG_WARN("unsupported sdk type: %s", ToString(type).c_str());
-        return nullptr;
+        case DataStorageType::DATA_STORAGE_TYPE_NFS:
+            sdk = std::make_shared<LocalFileSdk>();
+            break;
+        default:
+            KVCM_LOG_WARN("unsupported sdk type: %s", ToString(type).c_str());
+            return nullptr;
+        }
     }
     if (!sdk) {
         KVCM_LOG_WARN("create sdk failed, sdk is null, type:%s", ToString(type).c_str());

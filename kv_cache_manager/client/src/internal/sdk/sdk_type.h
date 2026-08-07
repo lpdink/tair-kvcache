@@ -18,6 +18,11 @@ enum class SdkType : uint8_t {
 
 // 一组block group对应一个remote path，支持一个远端文件/内存保存多个block的数据
 struct BlockGroup {
+    // indices[k] = 该组第 k 个元素在原始入参 remote_uris / local_buffers 中的下标。
+    // 保序契约：下标是 block 的唯一身份 —— block_keys[i] ↔ locations[i] ↔ buffers[i] ↔
+    // actual_uris[i] 必须一一对应。实现方（如 LocalFileSdk::Put）分组处理后必须按 indices
+    // 回填实际位置，禁止依赖 unordered_map 的迭代序（见 docs/design/client_sdk_io_contract.md）。
+    std::vector<size_t> indices;
     std::vector<DataStorageUri> remote_uris;
     BlockBuffers local_buffers;
 };

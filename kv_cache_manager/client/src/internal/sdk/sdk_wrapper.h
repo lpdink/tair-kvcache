@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -7,6 +8,7 @@
 #include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_type.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 
@@ -43,6 +45,15 @@ private:
         BlockBuffers buffers;
     };
 
+    // 单个线程池任务及其归因元信息（日志/统计用，见 01-contract.md §4.1 字段要求）
+    struct TimedTask {
+        SdkType sdk_type{SdkType::LOCAL_FILE}; // 统计与日志归因用 backend 类型
+        size_t group_index{0};                 // 分组序号（1-based）
+        size_t group_count{0};                 // 总分组数
+        size_t block_count{0};                 // 本组涉及的 block 数
+        std::function<ClientErrorCode()> fn;
+    };
+
     ClientErrorCode Valid(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers local_buffers);
     std::shared_ptr<SdkInterface> GetSdk(const DataStorageUri &remote_uri);
 
@@ -52,8 +63,13 @@ private:
                                std::vector<SdkGroup> &groups);
 
     std::string getOpTypeString(OpType op_type) const;
+    // deadline 在 Get/Put 入口计算一次（now + get/put_timeout_ms），统一向下传播：
+    // 1) 线程池任务启动时的准入检查（核心修复，见 00-context.md §6.1）；
+    // 2) 通过 SdkDeadline::Scope 传给 SDK 内部做逐 block/逐 key 检查。
+    // 超时/失败即刻返回，绝不等待 in-flight 任务（见 01-contract.md §2.1 否决项）。
     ClientErrorCode RunWithTimeoutParallel(OpType op_type,
-                                           std::vector<std::function<ClientErrorCode()>> &&tasks,
+                                           std::vector<TimedTask> &&tasks,
+                                           SdkDeadline::TimePoint deadline,
                                            int timeout_ms) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,

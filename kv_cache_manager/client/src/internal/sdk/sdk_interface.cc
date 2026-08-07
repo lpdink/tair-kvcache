@@ -9,6 +9,9 @@ SdkInterface::GroupMap SdkInterface::SplitByPath(const std::vector<DataStorageUr
         const auto &uri = remote_uris[i];
         const BlockBuffer &buf = local_buffers[i];
         auto &group = groups[uri.GetPath()];
+        // 记录原始下标：下标是 block 的唯一身份，消费方（如 Put 回填 actual_remote_uris）
+        // 必须按 indices 保序，禁止依赖 unordered_map 迭代序。
+        group.indices.push_back(i);
         group.remote_uris.push_back(uri);
         group.local_buffers.push_back(buf);
     }

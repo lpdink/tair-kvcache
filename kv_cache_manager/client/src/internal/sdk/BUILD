@@ -50,8 +50,10 @@ cc_library(
     name = "sdk",
     srcs = [
         "local_file_sdk.cc",
+        "sdk_deadline.cc",
         "sdk_factory.cc",
         "sdk_interface.cc",
+        "sdk_io_stats.cc",
         "sdk_wrapper.cc",
     ] + select({
         ":enable_mooncake": [
@@ -68,8 +70,10 @@ cc_library(
     }),
     hdrs = [
         "local_file_sdk.h",
+        "sdk_deadline.h",
         "sdk_factory.h",
         "sdk_interface.h",
+        "sdk_io_stats.h",
         "sdk_type.h",
         "sdk_wrapper.h",
     ] + select({
