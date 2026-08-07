@@ -321,11 +321,14 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
 ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                                   const BlockBuffers &local_buffers,
                                   std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
-    actual_remote_uris->clear();
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // 保序契约（01-contract.md §6）：actual_remote_uris[i] 必须对应 remote_uris[i]。
+    // 先按总大小 resize，再按 BlockGroup::indices 回填原位；禁止 clear() 后 append
+    // （那会依赖 unordered_map 的迭代序，交错多 path 输入必然错位）。
+    actual_remote_uris->resize(remote_uris.size());
     auto group_map = SplitByPath(remote_uris, local_buffers);
     size_t done_blocks = 0;
     for (const auto &group : group_map) {
@@ -336,15 +339,28 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
             return ER_SDK_TIMEOUT;
         }
         std::string file_path = group.first;
+        std::vector<DataStorageUri> group_actual_uris;
         if (!std::filesystem::exists(file_path)) {
-            auto ec = Alloc(group.second.remote_uris, *actual_remote_uris);
+            auto ec = Alloc(group.second.remote_uris, group_actual_uris);
             if (ec != ER_OK) {
                 KVCM_LOG_ERROR("Put failed, alloc failed, errorcode: %d", ec);
                 return ER_SDKALLOC_ERROR;
             }
+            if (group_actual_uris.size() != group.second.indices.size()) {
+                KVCM_LOG_ERROR("Put failed, alloc returned %zu uris but group has %zu blocks, path: %s",
+                               group_actual_uris.size(),
+                               group.second.indices.size(),
+                               file_path.c_str());
+                return ER_SDKALLOC_ERROR;
+            }
         } else {
-            actual_remote_uris->insert(
-                actual_remote_uris->end(), group.second.remote_uris.begin(), group.second.remote_uris.end());
+            // 文件已存在：实际位置就是原 uri，但仍须按 indices 回填（保序契约）。
+            group_actual_uris = group.second.remote_uris;
+        }
+        // 保序回填：indices[k] 是该组第 k 个元素在原始入参中的下标（下标是 block 的唯一身份）。
+        // 禁止 append 到 actual_remote_uris 末尾 —— 多 path 交错输入会错位（F3 保序）。
+        for (size_t k = 0; k < group.second.indices.size(); ++k) {
+            (*actual_remote_uris)[group.second.indices[k]] = group_actual_uris[k];
         }
         auto ec = DoPut(group.second.remote_uris, group.second.local_buffers);
         if (ec == ER_SDK_TIMEOUT) {

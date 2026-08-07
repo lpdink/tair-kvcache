@@ -333,6 +333,68 @@ TEST_F(LocalFileSdkTest, TestPutTimeoutStopsEarly) {
     FreeBuffers(buffers);
 }
 
+// 验收 3（F3 保序 + 01-contract.md §6 第4条）：交错多 path（A0,B0,A1,B1,A2）输入，
+// 断言 actual_remote_uris[i] 逐一等于 remote_uris[i]（下标即身份），
+// 且数据 Get 回来逐块与写入内容一致（跨 path 落位正确）。
+TEST_F(LocalFileSdkTest, TestPutActualUrisOrderWithInterleavedPaths) {
+    std::string file_a = root_path_ + "/local_file/interleaved_a.txt";
+    std::string file_b = root_path_ + "/local_file/interleaved_b.txt";
+    std::filesystem::remove(file_a);
+    std::filesystem::remove(file_b);
+
+    struct BlockSpec {
+        std::string file_path;
+        uint64_t blkid;
+        const char *payload;
+    };
+    // 交错输入：同一 path 的 block 在入参中不连续 —— 旧实现按 map 迭代序 append 必然错位。
+    std::vector<BlockSpec> blocks = {
+        {file_a, 0, "payload-A0-0123456789"},
+        {file_b, 0, "payload-B0-0123456789"},
+        {file_a, 1, "payload-A1-0123456789"},
+        {file_b, 1, "payload-B1-0123456789"},
+        {file_a, 2, "payload-A2-0123456789"},
+    };
+
+    std::vector<DataStorageUri> remote_uris;
+    BlockBuffers buffers;
+    for (const auto &b : blocks) {
+        remote_uris.push_back(MakeUri(b.file_path, b.blkid));
+        BlockBuffer buf;
+        Iov iov;
+        size_t len = std::strlen(b.payload) + 1; // 含结尾 \0，便于 memcmp
+        iov.base = malloc(len);
+        std::memcpy(iov.base, b.payload, len);
+        iov.size = len;
+        iov.type = MemoryType::CPU;
+        iov.ignore = false;
+        buf.iovs.push_back(iov);
+        buffers.push_back(buf);
+    }
+
+    LocalFileSdk sdk;
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, buffers, actual_remote_uris));
+    ASSERT_EQ(actual_remote_uris->size(), remote_uris.size());
+    // 保序契约：actual_remote_uris[i] 必须对应 remote_uris[i]。
+    for (size_t i = 0; i < remote_uris.size(); ++i) {
+        ASSERT_EQ(actual_remote_uris->at(i).ToUriString(), remote_uris[i].ToUriString());
+    }
+    // 数据按 blkid 落位：Get 回来逐块校验内容（含跨 path 交错）。
+    for (auto &buf : buffers) {
+        for (auto &iov : buf.iovs) {
+            std::memset(iov.base, 0, iov.size);
+        }
+    }
+    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, buffers));
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        size_t len = std::strlen(blocks[i].payload) + 1;
+        ASSERT_EQ(std::memcmp(buffers[i].iovs[0].base, blocks[i].payload, len), 0) << "block " << i << " content mismatch";
+    }
+    FreeBuffers(buffers);
+}
+
 // 验收 5（GPU，需 --config=client_with_cuda + GPU）：abort 路径返回后 stream 必须已同步。
 // 场景：块 0 的 256MB GPU async copy 已入队（DMA 需数 ms），块 1 URI size 非法触发
 // 既有错误分支提前返回 —— 断言返回后 SDK 私有 stream 空闲（cudaStreamQuery 成功），
