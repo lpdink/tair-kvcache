@@ -6,6 +6,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_sdk.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
 #include "kv_cache_manager/client/src/internal/sdk/test/mock/mock_hf3fs_usrbio_api.h"
 #include "kv_cache_manager/common/unittest.h"
 
@@ -241,6 +242,87 @@ TEST_F(Hf3fsSdkTest, GetBatch_ReturnOk_BothSuccess) {
     EXPECT_EQ(rc, ER_OK);
     EXPECT_EQ(std::string(out1, sizeof(out1)), std::string(16, 'a'));
     EXPECT_EQ(std::string(out2, sizeof(out2)), std::string(32, 'b'));
+}
+
+TEST_F(Hf3fsSdkTest, TestGetSkipsRemainingBlocksWhenExpired) {
+    // 两个可读文件；deadline 已过期时 Get 必须在循环开始处拦截，
+    // 不得为任何 block 创建 Hf3fsUsrbioClient / 发起 I/O（不 RegFd、不 prep、不 wait）。
+    auto path1 = (std::filesystem::path(mount_point_) / "get_expired/a/x.bin");
+    auto path2 = (std::filesystem::path(mount_point_) / "get_expired/b/y.bin");
+    std::error_code ec;
+    std::filesystem::create_directories(path1.parent_path(), ec);
+    std::filesystem::create_directories(path2.parent_path(), ec);
+    {
+        std::ofstream f1(path1, std::ios::out | std::ios::binary);
+        f1.seekp(8192 - 1);
+        f1.write("\0", 1);
+    }
+    {
+        std::ofstream f2(path2, std::ios::out | std::ios::binary);
+        f2.seekp(8192 - 1);
+        f2.write("\0", 1);
+    }
+
+    DataStorageUri u1, u2;
+    u1.SetPath(path1.string());
+    u1.SetParam("blkid", "0");
+    u1.SetParam("size", "4096");
+    u2.SetPath(path2.string());
+    u2.SetParam("blkid", "0");
+    u2.SetParam("size", "4096");
+
+    char out1[16] = {0};
+    char out2[16] = {0};
+    BlockBuffer b1, b2;
+    b1.iovs.push_back(Iov{MemoryType::CPU, out1, sizeof(out1), false});
+    b2.iovs.push_back(Iov{MemoryType::CPU, out2, sizeof(out2), false});
+    BlockBuffers bufs{b1, b2};
+    std::vector<DataStorageUri> uris{u1, u2};
+
+    auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
+    ASSERT_TRUE(mock != nullptr);
+    // 任何 block 都不得走到 Open()/RegFd，即未发起任何 io 准备
+    EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).Times(0);
+
+    {
+        // 已过期的 deadline
+        SdkDeadline::Scope scope(std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+        auto rc = sdk_->Get(uris, bufs);
+        EXPECT_EQ(rc, ER_SDK_TIMEOUT);
+    }
+}
+
+TEST_F(Hf3fsSdkTest, TestPutSkipsRemainingBlocksWhenExpired) {
+    DataStorageUri u1, u2;
+    u1.SetPath(
+        (std::filesystem::path(mount_point_) / ("put_expired_" + std::to_string(::getpid()) + "/a/x.bin")).string());
+    u1.SetParam("blkid", "1");
+    u1.SetParam("size", "4096");
+    u2.SetPath(
+        (std::filesystem::path(mount_point_) / ("put_expired_" + std::to_string(::getpid()) + "/b/y.bin")).string());
+    u2.SetParam("blkid", "2");
+    u2.SetParam("size", "4096");
+
+    BlockBuffer b1, b2;
+    char data1[16] = {0};
+    char data2[16] = {0};
+    b1.iovs.push_back(Iov{MemoryType::CPU, data1, sizeof(data1), false});
+    b2.iovs.push_back(Iov{MemoryType::CPU, data2, sizeof(data2), false});
+    BlockBuffers bufs{b1, b2};
+    std::vector<DataStorageUri> uris{u1, u2};
+
+    auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
+    ASSERT_TRUE(mock != nullptr);
+    // 任何 block 都不得走到 Open()/RegFd，即未发起任何 io 准备
+    EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).Times(0);
+
+    {
+        // 已过期的 deadline
+        SdkDeadline::Scope scope(std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+        auto out = std::make_shared<std::vector<DataStorageUri>>();
+        auto rc = sdk_->Put(uris, bufs, out);
+        EXPECT_EQ(rc, ER_SDK_TIMEOUT);
+    }
 }
 
 // ------------- Get (single) -------------

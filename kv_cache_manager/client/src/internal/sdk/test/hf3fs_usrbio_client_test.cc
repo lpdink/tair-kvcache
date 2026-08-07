@@ -2,11 +2,13 @@
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <time.h>
 
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_api.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_client.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
 #include "kv_cache_manager/client/src/internal/sdk/test/mock/mock_hf3fs_usrbio_api.h"
 #include "kv_cache_manager/common/unittest.h"
 
@@ -671,6 +673,99 @@ TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnTrue_AllDoneAndNonNegative) {
             }));
     Hf3fsIorHandle ior_handle = BuildIorHandle();
     EXPECT_TRUE(client_->WaitIos(ior_handle, 3));
+}
+
+// ---------- WaitIos abs_timeout ----------
+TEST_F(Hf3fsUsrbioClientTest, TestWaitIosPassesAbsTimeoutWhenDeadlineSet) {
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+
+    // 与实现同基准（CLOCK_REALTIME）记录进入前的墙钟时间，用于校验 abs_timeout 大致等于 now + 500ms。
+    struct timespec now {};
+    ASSERT_EQ(clock_gettime(CLOCK_REALTIME, &now), 0);
+
+    struct timespec captured {};
+    bool captured_null = true;
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [&](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int min_results, const struct timespec *abs) {
+                captured_null = (abs == nullptr);
+                if (abs != nullptr) {
+                    captured = *abs;
+                }
+                for (int i = 0; i < min_results; ++i) {
+                    cqes[i].result = 1;
+                }
+                return min_results;
+            }));
+
+    {
+        // 设置 deadline = now + 500ms
+        SdkDeadline::Scope scope(std::chrono::steady_clock::now() + std::chrono::milliseconds(500));
+        Hf3fsIorHandle ior_handle = BuildIorHandle();
+        EXPECT_TRUE(client_->WaitIos(ior_handle, 2, true));
+    }
+
+    EXPECT_FALSE(captured_null);
+    // abs 是 CLOCK_REALTIME 绝对时间：不小于进入时的 now，且不超过 now + 500ms + 合理误差
+    const int64_t diff_ms = (captured.tv_sec - now.tv_sec) * 1000 + (captured.tv_nsec - now.tv_nsec) / 1000000;
+    EXPECT_GE(diff_ms, 0);
+    EXPECT_LE(diff_ms, 700);
+}
+
+TEST_F(Hf3fsUsrbioClientTest, TestWaitIosPassesNullptrWhenNoDeadline) {
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+
+    bool captured_null = false;
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [&](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int min_results, const struct timespec *abs) {
+                captured_null = (abs == nullptr);
+                for (int i = 0; i < min_results; ++i) {
+                    cqes[i].result = 1;
+                }
+                return min_results;
+            }));
+
+    // 不设置 deadline：必须传 nullptr，保持旧行为（无超时等待）
+    Hf3fsIorHandle ior_handle = BuildIorHandle();
+    EXPECT_TRUE(client_->WaitIos(ior_handle, 2, true));
+    EXPECT_TRUE(captured_null);
+}
+
+TEST_F(Hf3fsUsrbioClientTest, TestReadTimeoutDoesNotCopyToCaller) {
+    // 准备足够大的文件满足 Read() 的 FileLength 检查
+    {
+        std::ofstream f(client_->filepath_, std::ios::binary | std::ios::trunc);
+        std::string blob(32, '\xAB');
+        f.write(blob.data(), blob.size());
+    }
+
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+    EXPECT_CALL(*api, Hf3fsRegFd(testing::_, testing::_)).WillOnce(testing::Return(0));
+    EXPECT_CALL(
+        *api, Hf3fsIorCreate(testing::_, testing::_, testing::_, true, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(0));
+    EXPECT_CALL(*api,
+                Hf3fsPrepIo(testing::_, testing::_, true, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*api, Hf3fsSubmitIos(testing::NotNull())).WillRepeatedly(testing::Return(0));
+    // 模拟超时：返回 0 个完成（少于 min_results）
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(1);
+    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(testing::AtLeast(1));
+
+    {
+        // 有 deadline（未过期），走超时等待路径
+        SdkDeadline::Scope scope(std::chrono::steady_clock::now() + std::chrono::milliseconds(500));
+        std::vector<uint8_t> buf(16, 0xEE); // 哨兵值
+        std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 16, false}};
+        EXPECT_FALSE(client_->Read(iovs));
+        // 超时路径不得执行 CopyIovs，caller buffer 必须保持哨兵值未被修改
+        for (const auto b : buf) {
+            EXPECT_EQ(b, 0xEE);
+        }
+    }
 }
 
 // ---------- BuildContiguousSegments ----------

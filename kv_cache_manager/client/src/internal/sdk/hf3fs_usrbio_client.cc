@@ -6,10 +6,12 @@
 #include <numeric>
 #include <optional>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_api.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
@@ -68,6 +70,13 @@ bool Hf3fsUsrbioClient::Read(const std::vector<Iov> &iovs) {
 }
 
 bool Hf3fsUsrbioClient::DoRead(const std::vector<Iov> &iovs) {
+    // 准入检查（01-contract.md §2）：deadline 已过期则直接返回，不发起 I/O。
+    // 无 deadline 时 Expired() 恒为 false，行为与旧版一致。
+    if (SdkDeadline::Expired()) {
+        KVCM_LOG_WARN("do read skipped, deadline expired, file: %s, iovs size: %zu", filepath_.c_str(), iovs.size());
+        return false;
+    }
+
     const auto segments = BuildContiguousSegments(iovs);
     if (segments.empty()) {
         KVCM_LOG_WARN("do read failed, segments are empty, file: %s, iovs size: %zu", filepath_.c_str(), iovs.size());
@@ -88,6 +97,9 @@ bool Hf3fsUsrbioClient::DoRead(const std::vector<Iov> &iovs) {
         return false;
     }
 
+    // 契约要求（01-contract.md §3 HF3FS 行）：CopyIovs 只在读取完全成功时执行，
+    // 超时/部分完成/出错时一律不把半成品数据交付给 caller。
+    // 顺序不可调整，防止后人"优化"时把 CopyIovs 挪到失败分支之前。
     CopyIovs(iovs, handle->iov_handle, true);
     ReleaseIovIor(handle);
     return true;
@@ -157,7 +169,7 @@ bool Hf3fsUsrbioClient::ReadFrom3FS(const std::shared_ptr<Hf3fsHandle> &handle,
             }
 
             // submit_io_count 达到最大或者没得读
-            if (!WaitIos(handle->ior_handle, submit_io_count)) {
+            if (!WaitIos(handle->ior_handle, submit_io_count, /*for_read=*/true)) {
                 read_success = false;
                 break;
             }
@@ -195,6 +207,13 @@ bool Hf3fsUsrbioClient::Write(const std::vector<Iov> &iovs) {
 }
 
 bool Hf3fsUsrbioClient::DoWrite(const std::vector<Iov> &iovs) {
+    // 准入检查（01-contract.md §2）：deadline 已过期则不做 CopyIovs 也不发起 I/O。
+    // 无 deadline 时 Expired() 恒为 false，行为与旧版一致。
+    if (SdkDeadline::Expired()) {
+        KVCM_LOG_WARN("do write skipped, deadline expired, file: %s, iovs size: %zu", filepath_.c_str(), iovs.size());
+        return false;
+    }
+
     const auto segments = BuildContiguousSegments(iovs);
     if (segments.empty()) {
         KVCM_LOG_WARN("do write failed, segments are empty, file: %s, iovs size: %zu", filepath_.c_str(), iovs.size());
@@ -278,7 +297,7 @@ bool Hf3fsUsrbioClient::WriteTo3FS(const std::shared_ptr<Hf3fsHandle> &handle,
                 break;
             }
 
-            if (!WaitIos(handle->ior_handle, submit_io_count)) {
+            if (!WaitIos(handle->ior_handle, submit_io_count, /*for_read=*/false)) {
                 write_success = false;
                 break;
             }
@@ -294,7 +313,9 @@ bool Hf3fsUsrbioClient::WriteTo3FS(const std::shared_ptr<Hf3fsHandle> &handle,
     return write_success;
 }
 
-bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle, int32_t submit_io_count) const {
+bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle,
+                                int32_t submit_io_count,
+                                bool for_read) const {
     if (ior_handle.ior == nullptr) {
         return false;
     }
@@ -303,35 +324,84 @@ bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle, int32_t submit
     auto ior = ior_handle.ior;
     const auto ior_entries = ior_handle.ior_entries;
 
-    int completed_io_count = usrbio_api_->Hf3fsWaitForIos(ior, cqes, submit_io_count, submit_io_count, nullptr);
+    // 有 deadline 时把 SdkDeadline::RemainingMs() 换算成 abs_timeout 传给 hf3fs_wait_for_ios，
+    // 使等待有界（01-contract.md §1）；无 deadline 时传 nullptr，保持旧行为（无限等待）。
+    //
+    // 时钟基准（实证，勿改）：本仓库链接的 libhf3fs_api_shared-1.2.1 由
+    // deepseek-ai/3FS@f6395e7d（open_source/package/build-hf3fs-usrbio-rpm.sh）构建，其
+    // src/lib/api/UsrbIo.cc 中 hf3fs_wait_for_ios 用 clock_gettime(CLOCK_REALTIME) 与
+    // abs_timeout 逐字段比较，并经 sem_timedwait 等待（POSIX 规定 sem_timedwait 的绝对
+    // 超时同样以 CLOCK_REALTIME 为基准）。因此 abs_timeout 必须用 CLOCK_REALTIME 计算；
+    // 若误用 CLOCK_MONOTONIC（epoch 不同），abs_timeout 会被视为早已过期，所有带
+    // deadline 的 3FS I/O 立即超时。SdkDeadline 的 steady_clock::time_point 不能直接
+    // 当作 timespec 使用，必须先取当前墙钟时间再叠加剩余预算。
+    int64_t remaining_ms = SdkDeadline::RemainingMs();
+    struct timespec abs_timeout {};
+    const struct timespec *abs_timeout_ptr = nullptr;
+    if (remaining_ms >= 0) {
+        if (clock_gettime(CLOCK_REALTIME, &abs_timeout) != 0) {
+            // 取不到时钟属于系统级异常，退化为无超时（旧行为），避免引入新的失败模式。
+            KVCM_LOG_WARN("wait io skipped abs timeout, clock_gettime failed, errno: %s, file: %s, read: %d, "
+                          "submit ios: %d, remaining ms: %lld",
+                          strerror(errno),
+                          filepath_.c_str(),
+                          for_read,
+                          submit_io_count,
+                          static_cast<long long>(remaining_ms));
+            abs_timeout_ptr = nullptr;
+        } else {
+            abs_timeout.tv_sec += remaining_ms / 1000;
+            abs_timeout.tv_nsec += (remaining_ms % 1000) * 1000000L;
+            if (abs_timeout.tv_nsec >= 1000000000L) {
+                abs_timeout.tv_sec += 1;
+                abs_timeout.tv_nsec -= 1000000000L;
+            }
+            abs_timeout_ptr = &abs_timeout;
+        }
+    }
+
+    int completed_io_count =
+        usrbio_api_->Hf3fsWaitForIos(ior, cqes, submit_io_count, submit_io_count, abs_timeout_ptr);
     if (completed_io_count < 0) {
-        KVCM_LOG_WARN("wait io failed, 3fs wait for ios failed, errno: %s, file: %s, submit ios: %d, ior entries: %d",
+        KVCM_LOG_WARN("wait io failed, 3fs wait for ios failed, errno: %s, file: %s, read: %d, submit ios: %d, "
+                      "ior entries: %d, remaining ms: %lld",
                       strerror(-completed_io_count),
                       filepath_.c_str(),
+                      for_read,
                       submit_io_count,
-                      ior_entries);
+                      ior_entries,
+                      static_cast<long long>(remaining_ms));
         return false;
     }
 
     for (int i = 0; i < completed_io_count; ++i) {
         if (cqes[i].result < 0) {
             KVCM_LOG_WARN(
-                "wait io failed, cqe result errno: %s, file: %s, submit ios: %d, completed ios: %d, ior entries: %d",
+                "wait io failed, cqe result errno: %s, file: %s, read: %d, submit ios: %d, completed ios: %d, "
+                "ior entries: %d, remaining ms: %lld",
                 strerror(-cqes[i].result),
                 filepath_.c_str(),
+                for_read,
                 submit_io_count,
                 completed_io_count,
-                ior_entries);
+                ior_entries,
+                static_cast<long long>(remaining_ms));
             return false;
         }
     }
 
     if (completed_io_count != submit_io_count) {
-        KVCM_LOG_WARN("wait io failed, file: %s, submit ios: %d, completed ios: %d, ior entries: %d",
+        // 部分完成：最常见诱因是 abs_timeout 到期（deadline 已设），也可能是真错误。
+        // 无论哪种，上层 ReadFrom3FS/WriteTo3FS 都会返回失败，DoRead 不会执行 CopyIovs，
+        // 不会把半成品数据交付给 caller（01-contract.md §3 HF3FS 行）。
+        KVCM_LOG_WARN("wait io timeout or incomplete, file: %s, read: %d, submit ios: %d, completed ios: %d, "
+                      "ior entries: %d, remaining ms: %lld",
                       filepath_.c_str(),
+                      for_read,
                       submit_io_count,
                       completed_io_count,
-                      ior_entries);
+                      ior_entries,
+                      static_cast<long long>(remaining_ms));
         return false;
     }
 

@@ -9,6 +9,7 @@
 
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
@@ -71,7 +72,17 @@ ClientErrorCode Hf3fsSdk::Get(const std::vector<DataStorageUri> &remote_uris, co
         return ER_INVALID_PARAMS;
     }
 
+    // 逐 block 准入检查（01-contract.md §2）：deadline 已过期则不再为后续 block
+    // 创建 Hf3fsUsrbioClient / 发起 I/O。无 deadline 时 Expired() 恒为 false，行为与旧版一致。
     for (size_t i = 0; i < remote_uris.size(); ++i) {
+        if (SdkDeadline::Expired()) {
+            KVCM_LOG_WARN("get skipped, deadline expired, path: %s, done blocks: %zu/%zu, remaining blocks skipped "
+                          "to protect caller buffer",
+                          remote_uris[i].GetPath().c_str(),
+                          i,
+                          remote_uris.size());
+            return ER_SDK_TIMEOUT;
+        }
         if (Get(remote_uris[i], local_buffers[i]) != ER_OK) {
             return ER_SDKREAD_ERROR;
         }
@@ -122,7 +133,16 @@ ClientErrorCode Hf3fsSdk::Put(const std::vector<DataStorageUri> &remote_uris,
         return ER_SDKALLOC_ERROR;
     }
 
+    // 逐 block 准入检查（01-contract.md §2）：deadline 已过期则不再为后续 block
+    // 创建 Hf3fsUsrbioClient / 发起 I/O。无 deadline 时 Expired() 恒为 false，行为与旧版一致。
     for (size_t i = 0; i < remote_uris.size(); ++i) {
+        if (SdkDeadline::Expired()) {
+            KVCM_LOG_WARN("put skipped, deadline expired, path: %s, done blocks: %zu/%zu, remaining blocks skipped",
+                          remote_uris[i].GetPath().c_str(),
+                          i,
+                          remote_uris.size());
+            return ER_SDK_TIMEOUT;
+        }
         if (Put(remote_uris[i], local_buffers[i]) != ER_OK) {
             return ER_SDKWRITE_ERROR;
         }

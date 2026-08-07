@@ -63,7 +63,8 @@ private:
     // write related
     bool DoWrite(const std::vector<Iov> &iovs);
     bool WriteTo3FS(const std::shared_ptr<Hf3fsHandle> &handle, const std::vector<Segment> &segments);
-    bool WaitIos(const Hf3fsIorHandle &ior_handle, int32_t submit_io_count) const;
+    // for_read 仅用于超时/失败日志归因（read/write）
+    bool WaitIos(const Hf3fsIorHandle &ior_handle, int32_t submit_io_count, bool for_read = true) const;
 
     // iov/ior related
     std::vector<Segment> BuildContiguousSegments(const std::vector<Iov> &iovs) const;
