@@ -1,8 +1,10 @@
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
 
+#include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -11,6 +13,7 @@
 #elif defined(USING_MUSA)
 #include "kv_cache_manager/client/src/internal/sdk/musa_util.h"
 #endif
+#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
 
@@ -67,6 +70,80 @@ private:
     bool is_mem_registered = false;
 #endif
 };
+
+// RAII guard：析构时若仍有在飞的 GPU async copy（cudaMemcpyAsync/musaMemcpyAsync 已入队），
+// 先同步 stream 再返回。目的：hard 契约（01-contract.md §2 第3条）—— LocalFileSdk 返回后
+// 不得再有异步 DMA 写 caller buffer（GPU 显存）。
+//
+// 必须覆盖所有提前返回路径（超时、既有的各种错误分支），因此用 RAII 而不是逐点调用
+// （逐点调用极易漏掉某条 return 路径，重新打开静默数据损坏窗口）。
+//
+// 构造顺序要求：必须在 MmapHelper 之后构造（后构造先析构），保证 stream 同步先于
+// MmapHelper 的 cudaHostUnregister + munmap 执行（否则 async copy 的源/目标地址
+// 可能已被 unmap）。
+class GpuStreamDrainGuard {
+public:
+#if defined(USING_CUDA)
+    explicit GpuStreamDrainGuard(cudaStream_t stream, bool *has_inflight)
+        : stream_(stream), has_inflight_(has_inflight) {}
+    ~GpuStreamDrainGuard() {
+        if (stream_ && has_inflight_ && *has_inflight_) {
+            CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_),
+                             "gpu stream synchronize fail on abort path, async copy may still write caller buffer");
+        }
+    }
+#elif defined(USING_MUSA)
+    explicit GpuStreamDrainGuard(musaStream_t stream, bool *has_inflight)
+        : stream_(stream), has_inflight_(has_inflight) {}
+    ~GpuStreamDrainGuard() {
+        if (stream_ && has_inflight_ && *has_inflight_) {
+            CHECK_MUSA_ERROR(musaStreamSynchronize(stream_),
+                             "musa stream synchronize fail on abort path, async copy may still write caller buffer");
+        }
+    }
+#else
+    explicit GpuStreamDrainGuard(bool *has_inflight) { (void)has_inflight; }
+    ~GpuStreamDrainGuard() = default;
+#endif
+    GpuStreamDrainGuard(const GpuStreamDrainGuard &) = delete;
+    GpuStreamDrainGuard &operator=(const GpuStreamDrainGuard &) = delete;
+
+private:
+#if defined(USING_CUDA)
+    cudaStream_t stream_;
+    bool *has_inflight_;
+#elif defined(USING_MUSA)
+    musaStream_t stream_;
+    bool *has_inflight_;
+#endif
+};
+
+// 超时中止路径的可归因日志（01-contract.md §4.1 必带字段）：
+// backend / op / 剩余预算 / 完成块数 / 在飞块下标与 caller buffer 地址。
+// deadline_remaining_ms <= 0 表示已过期。LocalFile 是 hard 级后端（buffer_level=hard）。
+void LogTimeoutAbort(const char *op,
+                     size_t done_blocks,
+                     size_t total_blocks,
+                     size_t in_flight_block,
+                     const kv_cache_manager::BlockBuffer &in_flight_buffer) {
+    std::string buf_addrs;
+    for (const auto &iov : in_flight_buffer.iovs) {
+        char addr[32];
+        std::snprintf(addr, sizeof(addr), "%p", iov.base);
+        if (!buf_addrs.empty()) {
+            buf_addrs += ",";
+        }
+        buf_addrs += addr;
+    }
+    KVCM_LOG_ERROR("local file sdk timeout abort: backend=local_file op=%s deadline_remaining_ms=%lld "
+                   "done_blocks=%zu/%zu in_flight_block=%zu caller_buffer_addrs=[%s] buffer_level=hard",
+                   op,
+                   static_cast<long long>(kv_cache_manager::SdkDeadline::RemainingMs()),
+                   done_blocks,
+                   total_blocks,
+                   in_flight_block,
+                   buf_addrs.c_str());
+}
 
 [[maybe_unused]] int getGpusDeviceCount() {
     int count = 0;
@@ -218,12 +295,25 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
         return ER_INVALID_PARAMS;
     }
     auto group_map = SplitByPath(remote_uris, local_buffers);
+    size_t done_blocks = 0;
     for (const auto &group : group_map) {
+        // 组级准入（01-contract.md §2 第2条）：deadline 已过则不再为后续组做
+        // open/mmap 等准备工作，直接返回超时。
+        if (SdkDeadline::Expired()) {
+            LogTimeoutAbort("get", done_blocks, remote_uris.size(), group.second.indices[0],
+                            group.second.local_buffers[0]);
+            return ER_SDK_TIMEOUT;
+        }
         auto ec = DoGet(group.second.remote_uris, group.second.local_buffers);
+        if (ec == ER_SDK_TIMEOUT) {
+            // 透传超时错误码，供 wrapper 层归因（不要把超时吞成普通读错误）。
+            return ER_SDK_TIMEOUT;
+        }
         if (ec != ER_OK) {
             KVCM_LOG_ERROR("DoGet failed, errorcode: %d", ec);
             return ER_SDKREAD_ERROR;
         }
+        done_blocks += group.second.remote_uris.size();
     }
     return ER_OK;
 }
@@ -237,7 +327,14 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
         return ER_INVALID_PARAMS;
     }
     auto group_map = SplitByPath(remote_uris, local_buffers);
+    size_t done_blocks = 0;
     for (const auto &group : group_map) {
+        // 组级准入：deadline 已过则不再为后续组做 exists/Alloc/mmap 等准备工作。
+        if (SdkDeadline::Expired()) {
+            LogTimeoutAbort("put", done_blocks, remote_uris.size(), group.second.indices[0],
+                            group.second.local_buffers[0]);
+            return ER_SDK_TIMEOUT;
+        }
         std::string file_path = group.first;
         if (!std::filesystem::exists(file_path)) {
             auto ec = Alloc(group.second.remote_uris, *actual_remote_uris);
@@ -250,10 +347,15 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
                 actual_remote_uris->end(), group.second.remote_uris.begin(), group.second.remote_uris.end());
         }
         auto ec = DoPut(group.second.remote_uris, group.second.local_buffers);
+        if (ec == ER_SDK_TIMEOUT) {
+            // 透传超时错误码，供 wrapper 层归因（不要把超时吞成普通写错误）。
+            return ER_SDK_TIMEOUT;
+        }
         if (ec != ER_OK) {
             KVCM_LOG_ERROR("Put failed, DoPut failed, errorcode: %d", ec);
             return ER_SDKWRITE_ERROR;
         }
+        done_blocks += group.second.remote_uris.size();
     }
     return ER_OK;
 }
@@ -323,13 +425,17 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     }
 
     MmapHelper helper(fd, file_mem, file_size);
+    // GpuStreamDrainGuard 必须在 MmapHelper 之后构造（后构造先析构）：任何提前返回
+    // 路径上，guard 析构会先同步 GPU stream，再执行 MmapHelper 的 unregister/munmap。
+    bool gpu_copy_enqueued = false;
 #if defined(USING_CUDA)
-    bool exist_gpu_iov = false; 
+    GpuStreamDrainGuard gpu_drain(cuda_stream_, &gpu_copy_enqueued);
     // If GPU supports direct pageable memory access, skip cudaHostRegister
     // This allows direct DMA transfer between GPU and mmap'd memory without pinning
     if (!support_pageable_memory_access_) {
         auto register_ec = helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
         if (register_ec != ER_OK) {
+            // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
         }
     } else {
@@ -337,19 +443,28 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         helper.SkipRegistration(); // Mark as not registered since we don't need to
     }
 #elif defined(USING_MUSA)
-    bool exist_gpu_iov = false;
+    GpuStreamDrainGuard gpu_drain(musa_stream_, &gpu_copy_enqueued);
     if (!support_pageable_memory_access_) {
         auto register_ec = helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
         if (register_ec != ER_OK) {
+            // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
         }
     }
+#else
+    GpuStreamDrainGuard gpu_drain(&gpu_copy_enqueued);
 #endif
 
     size_t offset = 0;
     char *src = static_cast<char *>(file_mem);
     // asume that url is sorted by blkid
     for (size_t i = 0; i < remote_uris.size(); ++i) {
+        // 逐 block 准入（01-contract.md §2 第2条）：deadline 已过则停止搬运，不再发起
+        // 后续 memcpy/async copy。若已有 GPU async copy 入队，guard 析构会在返回前同步。
+        if (SdkDeadline::Expired()) {
+            LogTimeoutAbort("get", /*done=*/i, remote_uris.size(), /*in_flight=*/i, local_buffers[i]);
+            return ER_SDK_TIMEOUT;
+        }
         auto &remote_uri = remote_uris[i];
         auto &local_buffer = local_buffers[i];
         if (remote_uri.GetPath().empty()) {
@@ -391,14 +506,15 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
                 if (iov.type == MemoryType::CPU) {
                     std::memcpy(iov.base, src + offset, iov.size);
                 } else if (iov.type == MemoryType::GPU) {
+                    // 先置位再入队：只要 async copy 入队成功，flag 必为 true；
+                    // 即使入队失败提前返回，guard 同步空闲 stream 也无害。
+                    gpu_copy_enqueued = true;
 #if defined(USING_CUDA)
-                    exist_gpu_iov = true;
                     CHECK_CUDA_ERROR_RETURN(
                         cudaMemcpyAsync(iov.base, src + offset, iov.size, cudaMemcpyHostToDevice, cuda_stream_),
                         ER_CUDAMEMCPY_ERROR,
                         "cuda memcpy async fail");
 #elif defined(USING_MUSA)
-                    exist_gpu_iov = true;
                     CHECK_MUSA_ERROR_RETURN(
                         musaMemcpyAsync(iov.base, src + offset, iov.size, musaMemcpyHostToDevice, musa_stream_),
                         ER_CUDAMEMCPY_ERROR,
@@ -411,14 +527,18 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     }
 
 #if defined(USING_CUDA)
-    if (exist_gpu_iov) {
+    if (gpu_copy_enqueued) {
         CHECK_CUDA_ERROR_RETURN(
             cudaStreamSynchronize(cuda_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "cuda stream synchronize fail");
+        // 已同步完成，guard 析构无需重复同步。
+        gpu_copy_enqueued = false;
     }
 #elif defined(USING_MUSA)
-    if (exist_gpu_iov) {
+    if (gpu_copy_enqueued) {
         CHECK_MUSA_ERROR_RETURN(
             musaStreamSynchronize(musa_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "musa stream synchronize fail");
+        // 已同步完成，guard 析构无需重复同步。
+        gpu_copy_enqueued = false;
     }
 #endif
 
@@ -494,13 +614,17 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
                    required_size,
                    DebugStringUtil::ToString(local_buffers).c_str());
     MmapHelper helper(fd, file_mem, required_size);
+    // GpuStreamDrainGuard 必须在 MmapHelper 之后构造（后构造先析构）：任何提前返回
+    // 路径上，guard 析构会先同步 GPU stream，再执行 MmapHelper 的 unregister/munmap。
+    bool gpu_copy_enqueued = false;
 #if defined(USING_CUDA)
-    bool exist_gpu_iov = false;
+    GpuStreamDrainGuard gpu_drain(cuda_stream_, &gpu_copy_enqueued);
     // If GPU supports direct pageable memory access, skip cudaHostRegister
     // This allows direct DMA transfer between GPU and mmap'd memory without pinning
     if (!support_pageable_memory_access_) {
         auto register_ec = helper.RegisterGpu(cudaHostRegisterDefault);
         if (register_ec != ER_OK) {
+            // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
         }
     } else {
@@ -508,19 +632,28 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         helper.SkipRegistration(); // Mark as not registered since we don't need to
     }
 #elif defined(USING_MUSA)
-    bool exist_gpu_iov = false;
+    GpuStreamDrainGuard gpu_drain(musa_stream_, &gpu_copy_enqueued);
     if (!support_pageable_memory_access_) {
         auto register_ec = helper.RegisterGpu(musaHostRegisterDefault);
         if (register_ec != ER_OK) {
+            // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
         }
     }
+#else
+    GpuStreamDrainGuard gpu_drain(&gpu_copy_enqueued);
 #endif
 
     char *dst = static_cast<char *>(file_mem);
     // url assumed sorted by blkid
     // ASSUMPTION: same as DoGet — all items in a batch must share the same `size`.
     for (size_t i = 0; i < items.size(); ++i) {
+        // 逐 block 准入（01-contract.md §2 第2条）：deadline 已过则停止搬运，不再发起
+        // 后续 memcpy/async copy。若已有 GPU async copy 入队，guard 析构会在返回前同步。
+        if (SdkDeadline::Expired()) {
+            LogTimeoutAbort("put", /*done=*/i, items.size(), /*in_flight=*/i, local_buffers[i]);
+            return ER_SDK_TIMEOUT;
+        }
         auto &item = items[i];
         auto &local_buffer = local_buffers[i];
         size_t offset = item.blkid * item.size;
@@ -536,14 +669,15 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
                 if (iov.type == MemoryType::CPU) {
                     std::memcpy(dst + offset, iov.base, iov.size);
                 } else if (iov.type == MemoryType::GPU) {
+                    // 先置位再入队：只要 async copy 入队成功，flag 必为 true；
+                    // 即使入队失败提前返回，guard 同步空闲 stream 也无害。
+                    gpu_copy_enqueued = true;
 #if defined(USING_CUDA)
-                    exist_gpu_iov = true;
                     CHECK_CUDA_ERROR_RETURN(
                         cudaMemcpyAsync(dst + offset, iov.base, iov.size, cudaMemcpyDeviceToHost, cuda_stream_),
                         ER_CUDAMEMCPY_ERROR,
                         "cuda memcpy async fail");
 #elif defined(USING_MUSA)
-                    exist_gpu_iov = true;
                     CHECK_MUSA_ERROR_RETURN(
                         musaMemcpyAsync(dst + offset, iov.base, iov.size, musaMemcpyDeviceToHost, musa_stream_),
                         ER_CUDAMEMCPY_ERROR,
@@ -555,14 +689,18 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         }
     }
 #if defined(USING_CUDA)
-    if (exist_gpu_iov) {
+    if (gpu_copy_enqueued) {
         CHECK_CUDA_ERROR_RETURN(
             cudaStreamSynchronize(cuda_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "cuda stream synchronize fail");
+        // 已同步完成，guard 析构无需重复同步。
+        gpu_copy_enqueued = false;
     }
 #elif defined(USING_MUSA)
-    if (exist_gpu_iov) {
+    if (gpu_copy_enqueued) {
         CHECK_MUSA_ERROR_RETURN(
             musaStreamSynchronize(musa_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "musa stream synchronize fail");
+        // 已同步完成，guard 析构无需重复同步。
+        gpu_copy_enqueued = false;
     }
 #endif
     if (msync(file_mem, required_size, MS_SYNC) != 0) {
