@@ -334,8 +334,10 @@ class HiCacheKVCM(HiCacheStorage):
         buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
         assert len(uris) == len(buffers)
         # Perform data transfer
+        # 读路径无租约：DDL = T_submit + sdk_get_timeout_ms（T_submit ≈ 调用时刻，全同步）。
+        get_deadline_us = time.monotonic_ns() // 1000 + self.sdk_get_timeout_ms * 1000
         start_time = time.perf_counter()
-        result = self.transfer_client.LoadKvCaches(uris, buffers)
+        result = self.transfer_client.LoadKvCaches(uris, buffers, get_deadline_us)
         end_time = time.perf_counter()
         self.prefetch_pgs.append(matched)
         self.prefetch_bandwidth.append(matched * self.location_spec_size / (1 << 30) / (end_time - start_time))
@@ -409,8 +411,10 @@ class HiCacheKVCM(HiCacheStorage):
                 )
                 assert len(uris) == len(buffers)
 
+                # 读路径无租约：DDL = T_submit + sdk_get_timeout_ms。
+                get_deadline_us = time.monotonic_ns() // 1000 + self.sdk_get_timeout_ms * 1000
                 start_time = time.perf_counter()
-                load_result = self.transfer_client.LoadKvCaches(uris, buffers)
+                load_result = self.transfer_client.LoadKvCaches(uris, buffers, get_deadline_us)
                 end_time = time.perf_counter()
                 flag = (load_result == kvcm_py_client.ClientErrorCode.ER_OK)
                 if flag:
@@ -458,6 +462,11 @@ class HiCacheKVCM(HiCacheStorage):
         local_hash = hash((len_prefix, len_new, *block_keys))  # Hash covers prefix/new boundary + all keys
 
         # Start write cache
+        # DDL_租约 = T0 + write_timeout_seconds（T0 = start_write_cache 拿到响应的时刻）。
+        # 跨 rank 一致性：只有 rank0 调 start_write_cache，非 rank0 的"拿到响应时刻"是
+        # broadcast 收包时刻（晚于 rank0）。若各 rank 各自按本地 T0 算，非 rank0 的租约
+        # 期限会比 manager 实际 reclaim 时刻更晚，存在越界写已回收 URI 的窗口。
+        # 因此：rank0 算好 lease_deadline_us，随 broadcast 列表下发，全 rank 用同一个值。
         if self.tp_rank == 0:
             start_trace_id = f"start-{trace_id}"
             # When extra pools exist, use KV spec group to write KV specs only
@@ -477,20 +486,30 @@ class HiCacheKVCM(HiCacheStorage):
                 logger.error(f"start_write_cache failed: {e}")
                 result = None
 
+            # 时间源：time.monotonic_ns() 与 C++ steady_clock 同为 CLOCK_MONOTONIC（已实测），
+            # 直接传 us 数值比较。start_write_cache 失败时无租约期限（0）。
+            lease_deadline_us = (
+                time.monotonic_ns() // 1000 + int(self.write_timeout_seconds * 1_000_000)
+                if result is not None
+                else 0
+            )
+
             if self.tp_world_size > 1 and not self.is_mla_model:
                 torch.distributed.broadcast_object_list(
-                    [result, len_prefix, len_new, local_hash], src=0, group=self.storage_tp_group
+                    [result, len_prefix, len_new, local_hash, lease_deadline_us],
+                    src=0,
+                    group=self.storage_tp_group,
                 )
         elif self.is_mla_model:
             logger.warning(f"_batch_set called on non-rank-0 (tp_rank={self.tp_rank}) "
                            f"for MLA model; only rank 0 should write. Returning all False.")
             return [False] * len_new
         else:
-            recv = [None, None, None, None]
+            recv = [None, None, None, None, None]
             torch.distributed.broadcast_object_list(
                 recv, src=0, group=self.storage_tp_group
             )
-            result, len_prefix, len_new, rank0_hash = recv
+            result, len_prefix, len_new, rank0_hash, lease_deadline_us = recv
 
         logger.debug(f"start_write_cache {result=}")
 
@@ -595,8 +614,16 @@ class HiCacheKVCM(HiCacheStorage):
                     assert len(uris) == len(buffers)
 
                     # Perform data transfer
+                    # T_submit = 调用前一刻（全同步无传输线程池，无排队窗口）。
+                    # DDL_自律 = T_submit + sdk_put_timeout_ms；与 rank0 广播下发的
+                    # DDL_租约取 min：租约是"绝不能打破"的外层期限，自律是快速失败。
+                    self_deadline_us = time.monotonic_ns() // 1000 + self.sdk_put_timeout_ms * 1000
+                    if lease_deadline_us > 0:
+                        deadline_us = min(lease_deadline_us, self_deadline_us)
+                    else:
+                        deadline_us = self_deadline_us
                     start_time = time.perf_counter()
-                    result = self.transfer_client.SaveKvCaches(uris, buffers)
+                    result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_us)
                     end_time = time.perf_counter()
                     self.backup_pgs.append(num_valid)
                     self.backup_bandwidth.append(num_valid * self.location_spec_size / (1 << 30) / (end_time - start_time))
@@ -710,9 +737,17 @@ class HiCacheKVCM(HiCacheStorage):
                     except Exception as e:
                         logger.error(f"start_write_cache failed on rank 0: {trace_id=} {e=}")
                         write_result = None
+                    # DDL_租约：rank0 在 T0（拿到响应）后计算，随 broadcast 下发，
+                    # 全 rank 用同一个值（非 rank0 的 broadcast 收包时刻晚于 rank0，
+                    # 各自算会让租约期限越界，见 _batch_set 注释）。
+                    lease_deadline_us = (
+                        time.monotonic_ns() // 1000 + int(self.write_timeout_seconds * 1_000_000)
+                        if write_result is not None
+                        else 0
+                    )
                     if self.tp_world_size > 1 and not self.is_mla_model:
                         torch.distributed.broadcast_object_list(
-                            [write_result], src=0, group=self.storage_tp_group
+                            [write_result, lease_deadline_us], src=0, group=self.storage_tp_group
                         )
                 elif self.is_mla_model:
                     logger.warning(f"batch_set_v2 called on non-rank-0 (tp_rank={self.tp_rank}) "
@@ -720,11 +755,11 @@ class HiCacheKVCM(HiCacheStorage):
                     results[transfer.name] = [False] * len(keys)
                     continue
                 else:
-                    recv = [None]
+                    recv = [None, None]
                     torch.distributed.broadcast_object_list(
                         recv, src=0, group=self.storage_tp_group
                     )
-                    write_result = recv[0]
+                    write_result, lease_deadline_us = recv
                 if write_result is None:
                     results[transfer.name] = [False] * len(keys)
                     continue
@@ -790,8 +825,15 @@ class HiCacheKVCM(HiCacheStorage):
                         ptr_list, size_list, components
                     )
                     assert len(uris) == len(buffers)
+                    # DDL_自律 = T_submit + sdk_put_timeout_ms，与 rank0 广播下发的
+                    # DDL_租约取 min（见 _batch_set 注释）。
+                    self_deadline_us = time.monotonic_ns() // 1000 + self.sdk_put_timeout_ms * 1000
+                    if lease_deadline_us > 0:
+                        deadline_us = min(lease_deadline_us, self_deadline_us)
+                    else:
+                        deadline_us = self_deadline_us
                     start_time = time.perf_counter()
-                    save_result = self.transfer_client.SaveKvCaches(uris, buffers)
+                    save_result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_us)
                     end_time = time.perf_counter()
                     flag = (save_result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
                     if flag:

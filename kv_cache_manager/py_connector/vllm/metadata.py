@@ -8,6 +8,11 @@ class SaveRequest:
     target_locations: list[dict]
     manager_block_idxes: list
     write_session_id: str
+    # DDL_租约：scheduler 在 start_write_cache 响应（T0）后计算
+    # （T0 + write_timeout_seconds，绝对 steady_clock 微秒），随 pickle 跨
+    # scheduler→worker 透传；worker 侧与 DDL_自律取 min 后传给 SaveKvCaches。
+    # 0 = 无租约期限（仅防老版本 pickle 兼容，正常路径恒非 0）。
+    deadline_us: int = 0
 
 
 @dataclass()

@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
 import logging
+import time
 import uuid
 import math
 
@@ -121,8 +122,10 @@ def tp_rank_to_spec_name(tp_rank: int) -> str:
 class KVCMKvCacheConnectorMetadata:
     # [locations, block_ids]
     load: list[tuple[list[str], list[int]]] = field(default_factory=list)
-    # [locations, block_ids, write_session_id]
-    save: list[tuple[list[str], list[int], str]] = field(default_factory=list)
+    # [locations, block_ids, write_session_id, deadline_us]
+    # deadline_us = DDL_租约（Leader 在 start_write_cache 响应 T0 后算出的绝对
+    # steady_clock 微秒，0=无租约期限），经框架透传给 Worker，Worker 与 DDL_自律取 min。
+    save: list[tuple[list[str], list[int], str, int]] = field(default_factory=list)
 
 
 class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
@@ -138,6 +141,12 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         self.instance_id = self.kvcm_config["instance_id"]
 
         self.write_timeout_seconds = self.kvcm_config.get("write_timeout_seconds", 30)
+
+        # sdk_get/put_timeout_ms 目前只在 init_kvcm_transfer_client 里作为局部变量
+        # （本文件 :75-76）—— Worker 的 wait_for_save/start_load_kv 需要它们计算
+        # DDL_自律，必须先落到 self 上（connector-dataflow.md 6.3 前置缺口）。
+        self.sdk_get_timeout_ms = self.kvcm_config.get("sdk_get_timeout_ms", 15000)
+        self.sdk_put_timeout_ms = self.kvcm_config.get("sdk_put_timeout_ms", 15000)
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         assert self.kv_cache_tensor is None, "KV cache tensor already registered"
@@ -210,7 +219,9 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         for locations, block_ids in self._metadata.load:
             uris = self._extract_uris(locations)
             buffers, cpu_tensors = self._prepare_buffers(block_ids)
-            result = self.transfer_client.LoadKvCaches(uris, buffers)
+            # 读路径无租约：DDL = T_submit + sdk_get_timeout_ms（全同步，T_submit≈调用时刻）。
+            get_deadline_us = time.monotonic_ns() // 1000 + self.sdk_get_timeout_ms * 1000
+            result = self.transfer_client.LoadKvCaches(uris, buffers, get_deadline_us)
             logger.debug(f"LoadKvCaches {result=}")
             for block_id, cpu_tensor in zip(block_ids, cpu_tensors):
                 self.kv_cache_tensor[block_id].copy_(cpu_tensor, non_blocking=False)
@@ -226,10 +237,17 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         # Make sure the forward pass is complete before beginning our save.
         stream.synchronize()
 
-        for locations, block_ids, write_session_id in self._metadata.save:
+        for locations, block_ids, write_session_id, lease_deadline_us in self._metadata.save:
             uris = self._extract_uris(locations)
             buffers, _ = self._prepare_buffers(block_ids)
-            result = self.transfer_client.SaveKvCaches(uris, buffers)
+            # DDL_自律 = T_submit + sdk_put_timeout_ms；与 Leader 算好的 DDL_租约
+            # （随 metadata 透传）取 min：租约是"绝不能打破"的外层期限，自律是快速失败。
+            self_deadline_us = time.monotonic_ns() // 1000 + self.sdk_put_timeout_ms * 1000
+            if lease_deadline_us > 0:
+                deadline_us = min(lease_deadline_us, self_deadline_us)
+            else:
+                deadline_us = self_deadline_us
+            result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_us)
             logger.debug(f"SaveKvCaches {result=}")
             flag = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
             if self.tp_world_size > 1:
@@ -348,8 +366,14 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
             save_indices = self._parse_block_mask(block_mask, len(block_keys))
             assert len(store_locations) == len(save_indices)
 
-            metadata.save.append((store_locations, [block_ids[block_pos]
-                                 for block_pos in save_indices], write_session_id))
+            # DDL_租约：T0（start_write_cache 响应时刻）+ write_timeout_seconds。
+            # 时间源：time.monotonic_ns() 与 C++ steady_clock 同为 CLOCK_MONOTONIC（已实测），
+            # 直接传 us 数值比较。随 save 元组经框架透传给 Worker，Worker 与 DDL_自律取 min。
+            lease_deadline_us = time.monotonic_ns() // 1000 + int(self.write_timeout_seconds * 1_000_000)
+            metadata.save.append((store_locations,
+                                  [block_ids[block_pos] for block_pos in save_indices],
+                                  write_session_id,
+                                  lease_deadline_us))
         
         logger.info(f"{metadata=}")
 
