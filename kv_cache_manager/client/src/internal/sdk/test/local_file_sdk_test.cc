@@ -1,13 +1,12 @@
-#include <gtest/gtest.h>
-
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <gtest/gtest.h>
 #include <unistd.h>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
-#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
 #include "kv_cache_manager/common/unittest.h"
 #ifdef USING_CUDA
 #include <cuda_runtime.h>
@@ -130,8 +129,8 @@ TEST_F(LocalFileSdkTest, TestPutGetWithCpu) {
     BlockBuffers local_buffers = {buf};
 
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_SDKWRITE_ERROR, sdk.Put(invalid_remote_uris, local_buffers, actual_remote_uris));
-    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
+    ASSERT_EQ(ER_SDKWRITE_ERROR, sdk.Put(invalid_remote_uris, local_buffers, actual_remote_uris, /*deadline_us=*/0));
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris, /*deadline_us=*/0));
     ASSERT_EQ(actual_remote_uris->size(), 1);
     ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), uri.ToUriString());
     free(put_buffer);
@@ -143,8 +142,8 @@ TEST_F(LocalFileSdkTest, TestPutGetWithCpu) {
         iov.base = static_cast<char *>(get_buffer) + offset;
         offset += iov.size;
     }
-    ASSERT_EQ(ER_SDKREAD_ERROR, sdk.Get(invalid_remote_uris, local_buffers));
-    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, local_buffers));
+    ASSERT_EQ(ER_SDKREAD_ERROR, sdk.Get(invalid_remote_uris, local_buffers, /*deadline_us=*/0));
+    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, local_buffers, /*deadline_us=*/0));
     auto &iov1_res = local_buffers[0].iovs[0];
     ASSERT_EQ(std::memcmp(iov1_res.base, test_data, iov1_res.size), 0);
     auto &iov2_res = local_buffers[0].iovs[1];
@@ -197,8 +196,8 @@ TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {
 
     // put
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_SDKWRITE_ERROR, sdk.Put(invalid_remote_uris, local_buffers, actual_remote_uris));
-    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
+    ASSERT_EQ(ER_SDKWRITE_ERROR, sdk.Put(invalid_remote_uris, local_buffers, actual_remote_uris, /*deadline_us=*/0));
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris, /*deadline_us=*/0));
     ASSERT_EQ(actual_remote_uris->size(), 1);
     ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), uri.ToUriString());
 
@@ -215,8 +214,8 @@ TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {
         offset += iov.size;
     }
 
-    ASSERT_EQ(ER_SDKREAD_ERROR, sdk.Get(invalid_remote_uris, local_buffers));
-    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, local_buffers));
+    ASSERT_EQ(ER_SDKREAD_ERROR, sdk.Get(invalid_remote_uris, local_buffers, /*deadline_us=*/0));
+    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, local_buffers, /*deadline_us=*/0));
 
     void *host_get_buffer = malloc(len1 + len2);
     ASSERT_EQ(cudaMemcpy(host_get_buffer, gpu_get_buffer, len1 + len2, cudaMemcpyDeviceToHost), cudaSuccess);
@@ -252,8 +251,7 @@ TEST_F(LocalFileSdkTest, TestGetTimeoutStopsEarly) {
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
     {
         // 已过期的 deadline：任何 I/O 都不应发起。
-        SdkDeadline::Scope scope(std::chrono::steady_clock::now() - std::chrono::seconds(1));
-        ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, buffers));
+        ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, buffers, SteadyClockUs() - 1'000'000));
     }
     for (const auto &buf : buffers) {
         AssertBufferAllBytes(buf, 0xA5); // 一个 block 都没搬
@@ -291,10 +289,7 @@ TEST_F(LocalFileSdkTest, TestGetTimeoutMidway) {
 
     LocalFileSdk sdk;
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
-    {
-        SdkDeadline::Scope scope(std::chrono::steady_clock::now() + std::chrono::milliseconds(8));
-        ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, buffers));
-    }
+    { ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, buffers, SteadyClockUs() + 8'000)); }
     // 头块已搬（稀疏文件读回全零）→ 证明是"中途停下"而不是"入口就返回"。
     // 注意：仅非 CUDA 构建可断言 —— GPU 构建下 Init 会对 512MB mmap 做
     // cudaHostRegister（本机实测 ~224ms），预算在第一个 block 之前就被注册消耗掉，
@@ -324,10 +319,7 @@ TEST_F(LocalFileSdkTest, TestPutTimeoutStopsEarly) {
     LocalFileSdk sdk;
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    {
-        SdkDeadline::Scope scope(std::chrono::steady_clock::now() - std::chrono::seconds(1));
-        ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Put(remote_uris, buffers, actual_remote_uris));
-    }
+    { ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Put(remote_uris, buffers, actual_remote_uris, SteadyClockUs() - 1'000'000)); }
     // 准入拦截发生在 Alloc/写文件之前。
     ASSERT_FALSE(std::filesystem::exists(file_path));
     FreeBuffers(buffers);
@@ -375,7 +367,7 @@ TEST_F(LocalFileSdkTest, TestPutActualUrisOrderWithInterleavedPaths) {
     LocalFileSdk sdk;
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, buffers, actual_remote_uris));
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, buffers, actual_remote_uris, /*deadline_us=*/0));
     ASSERT_EQ(actual_remote_uris->size(), remote_uris.size());
     // 保序契约：actual_remote_uris[i] 必须对应 remote_uris[i]。
     for (size_t i = 0; i < remote_uris.size(); ++i) {
@@ -387,10 +379,11 @@ TEST_F(LocalFileSdkTest, TestPutActualUrisOrderWithInterleavedPaths) {
             std::memset(iov.base, 0, iov.size);
         }
     }
-    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, buffers));
+    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, buffers, /*deadline_us=*/0));
     for (size_t i = 0; i < blocks.size(); ++i) {
         size_t len = std::strlen(blocks[i].payload) + 1;
-        ASSERT_EQ(std::memcmp(buffers[i].iovs[0].base, blocks[i].payload, len), 0) << "block " << i << " content mismatch";
+        ASSERT_EQ(std::memcmp(buffers[i].iovs[0].base, blocks[i].payload, len), 0)
+            << "block " << i << " content mismatch";
     }
     FreeBuffers(buffers);
 }
@@ -443,7 +436,7 @@ TEST_F(LocalFileSdkTest, TestGpuAbortPathDrainsStream) {
         buffers.push_back(buf);
     }
 
-    ASSERT_EQ(ER_SDKREAD_ERROR, sdk.Get(remote_uris, buffers));
+    ASSERT_EQ(ER_SDKREAD_ERROR, sdk.Get(remote_uris, buffers, /*deadline_us=*/0));
     // hard 契约：返回后 SDK stream 必须已同步（否则 256MB DMA 仍在写 caller 显存）。
     ASSERT_EQ(cudaStreamQuery(sdk.cuda_stream_), cudaSuccess);
 

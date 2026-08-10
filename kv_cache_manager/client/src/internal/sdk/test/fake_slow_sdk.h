@@ -9,8 +9,8 @@
 //  - write_after_return                    ：模拟"返回后仍写 caller buffer"的违约
 //                                            （soft 级，如 mooncake）后端
 //  - get_call_count() / put_call_count()   ：断言超时任务从未发起 I/O（准入检查核心验证）
-//  - deadline_has_value / deadline_remaining_ms：Get 入口对 SdkDeadline 的观测
-//                                            （验证 deadline 传播）
+//  - deadline_set / deadline_remaining_ms  ：Get 入口对传入 deadline_us 的观测
+//                                            （验证 deadline 透传）
 //  - touch_buffer_on_get                   ：正常路径写 kTouchByte，验证成功时数据确实被搬运
 //
 // 稳定性约定：所有跨线程控制字段都是 std::atomic（池内工作线程与测试线程共享）；
@@ -25,7 +25,7 @@
 
 #include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
-#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
@@ -33,26 +33,26 @@ namespace kv_cache_manager {
 
 // fake 的控制面与观测面。同一实例可被多个池内任务并发访问，全部用原子量。
 struct FakeSlowSdkControl {
-    std::atomic<int> get_call_count{0};            // Get 被发起的次数（准入检查的核心断言对象）
-    std::atomic<int> put_call_count{0};            // Put 被发起的次数
-    std::atomic<int> get_delay_ms{0};              // Get 内的睡眠时长（模拟慢 I/O）
-    std::atomic<int> per_block_delay_ms{0};        // 逐 block 睡眠时长（模拟逐 block 慢）
-    std::atomic<bool> per_block_check{false};      // 开启逐 block 前置准入检查（契约 §2(2)）
-    std::atomic<bool> write_after_return{false};   // 违约：sleep 结束后仍写 caller buffer
-    std::atomic<bool> touch_buffer_on_get{false};  // 正常路径：Get 返回前写 kTouchByte
+    std::atomic<int> get_call_count{0};           // Get 被发起的次数（准入检查的核心断言对象）
+    std::atomic<int> put_call_count{0};           // Put 被发起的次数
+    std::atomic<int> get_delay_ms{0};             // Get 内的睡眠时长（模拟慢 I/O）
+    std::atomic<int> per_block_delay_ms{0};       // 逐 block 睡眠时长（模拟逐 block 慢）
+    std::atomic<bool> per_block_check{false};     // 开启逐 block 前置准入检查（契约 §2(2)）
+    std::atomic<bool> write_after_return{false};  // 违约：sleep 结束后仍写 caller buffer
+    std::atomic<bool> touch_buffer_on_get{false}; // 正常路径：Get 返回前写 kTouchByte
     std::atomic<int> get_result{static_cast<int>(ER_OK)};
 
-    // Get 入口处对 SdkDeadline 的观测（3.5 deadline 传播验证）。
-    std::atomic<bool> deadline_has_value{false};
+    // Get 入口对传入 deadline_us 的观测（3.5 deadline 透传验证）。
+    std::atomic<bool> deadline_set{false};
     std::atomic<int64_t> deadline_remaining_ms{-1};
 
     // 事件（原子标志，测试轮询等待；替代"睡 X ms 后断言"的紧耦合时序）。
-    std::atomic<bool> get_done{false};       // Get 完全结束（含延迟与违约写入）
-    std::atomic<bool> write_done{false};     // 违约写入完成后置位
-    std::atomic<size_t> blocks_touched{0};   // 逐 block 模式：已处理（touch）的 block 数
+    std::atomic<bool> get_done{false};     // Get 完全结束（含延迟与违约写入）
+    std::atomic<bool> write_done{false};   // 违约写入完成后置位
+    std::atomic<size_t> blocks_touched{0}; // 逐 block 模式：已处理（touch）的 block 数
 
-    static constexpr uint8_t kTouchByte = 0x3C;         // 正常搬运（成功交付）的哨兵字节
-    static constexpr uint8_t kAfterReturnByte = 0x5A;   // 违约后端返回后写入的字节
+    static constexpr uint8_t kTouchByte = 0x3C;       // 正常搬运（成功交付）的哨兵字节
+    static constexpr uint8_t kAfterReturnByte = 0x5A; // 违约后端返回后写入的字节
     std::atomic<uint8_t> after_return_byte{kAfterReturnByte};
 };
 
@@ -61,16 +61,16 @@ class FakeSlowSdk : public SdkInterface {
 public:
     explicit FakeSlowSdk(std::shared_ptr<FakeSlowSdkControl> ctrl) : ctrl_(std::move(ctrl)) {}
 
-    ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
-                         const std::shared_ptr<StorageConfig> &) override {
+    ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &, const std::shared_ptr<StorageConfig> &) override {
         return ER_OK;
     }
     SdkType Type() override { return SdkType::LOCAL_FILE; }
 
-    ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &local_buffers) override {
+    ClientErrorCode
+    Get(const std::vector<DataStorageUri> &, const BlockBuffers &local_buffers, int64_t deadline_us) override {
         ctrl_->get_call_count.fetch_add(1);
-        ctrl_->deadline_has_value.store(SdkDeadline::Get().has_value());
-        ctrl_->deadline_remaining_ms.store(SdkDeadline::RemainingMs());
+        ctrl_->deadline_set.store(deadline_us > 0);
+        ctrl_->deadline_remaining_ms.store(DeadlineRemainingMs(deadline_us));
         ctrl_->get_done.store(false);
         ctrl_->write_done.store(false);
         ctrl_->blocks_touched.store(0);
@@ -84,7 +84,7 @@ public:
         if (ctrl_->per_block_check.load()) {
             size_t touched = 0;
             for (size_t i = 0; i < buffers->size(); ++i) {
-                if (SdkDeadline::Expired()) {
+                if (DeadlineExpired(deadline_us)) {
                     ctrl_->blocks_touched.store(touched);
                     ctrl_->get_done.store(true);
                     return ER_SDK_TIMEOUT;
@@ -127,15 +127,14 @@ public:
 
     ClientErrorCode Put(const std::vector<DataStorageUri> &,
                         const BlockBuffers &,
-                        std::shared_ptr<std::vector<DataStorageUri>>) override {
+                        std::shared_ptr<std::vector<DataStorageUri>>,
+                        int64_t deadline_us) override {
         ctrl_->put_call_count.fetch_add(1);
         return ER_OK;
     }
 
 protected:
-    ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override {
-        return ER_OK;
-    }
+    ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override { return ER_OK; }
 
 private:
     static void TouchBlock(BlockBuffers &buffers, size_t block_index, uint8_t byte) {

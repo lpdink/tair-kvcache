@@ -16,12 +16,11 @@
 // （get_done/write_done/轮询）替代 sleep 同步；"证明某事没有发生"处给足余量
 // （如返回后等 500ms 再断言哨兵完好）；测试目标 size=medium（含 sleep）。
 
-#include <gtest/gtest.h>
-
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <gtest/gtest.h>
 #include <memory>
 #include <string>
 #include <thread>
@@ -30,6 +29,7 @@
 #include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_io_stats.h"
@@ -79,16 +79,20 @@ protected:
             ],
             "block_size": 128,
             "sdk_config": {
-                "thread_num": )" + std::to_string(thread_num) + R"(,
-                "queue_size": )" + std::to_string(queue_size) + R"(,
+                "thread_num": )" + std::to_string(thread_num) +
+                                        R"(,
+                "queue_size": )" + std::to_string(queue_size) +
+                                        R"(,
                 "sdk_backend_configs": [
                     {
                         "type": "file"
                     }
                 ],
                 "timeout_config": {
-                    "put_timeout_ms": )" + std::to_string(put_timeout_ms) + R"(,
-                    "get_timeout_ms": )" + std::to_string(get_timeout_ms) + R"(
+                    "put_timeout_ms": )" +
+                                        std::to_string(put_timeout_ms) + R"(,
+                    "get_timeout_ms": )" +
+                                        std::to_string(get_timeout_ms) + R"(
                 }
             },
             "model_deployment": {
@@ -115,18 +119,17 @@ protected:
     std::string MakeDualFileStorageConfigs(const std::string &name_a, const std::string &name_b) {
         return "[{\"type\":\"file\",\"global_unique_name\":\"" + name_a +
                "\",\"storage_spec\":{\"root_path\":\"/nfs_a/\",\"key_count_per_file\":2}},"
-               "{\"type\":\"file\",\"global_unique_name\":\"" + name_b +
-               "\",\"storage_spec\":{\"root_path\":\"/nfs_b/\",\"key_count_per_file\":2}}]";
+               "{\"type\":\"file\",\"global_unique_name\":\"" +
+               name_b + "\",\"storage_spec\":{\"root_path\":\"/nfs_b/\",\"key_count_per_file\":2}}]";
     }
 
     // 为指定 host（storage global_unique_name）注册 fake creator；wrapper Init 命中注入缝。
-    void RegisterFakeForTest(const std::string &global_unique_name,
-                             const std::shared_ptr<FakeSlowSdkControl> &ctrl) {
+    void RegisterFakeForTest(const std::string &global_unique_name, const std::shared_ptr<FakeSlowSdkControl> &ctrl) {
         SdkFactory::GetInstance()->RegisterCustomCreatorForTest(
             DataStorageType::DATA_STORAGE_TYPE_NFS,
-            [global_unique_name, ctrl](const std::shared_ptr<SdkBackendConfig> &,
-                                       const std::shared_ptr<StorageConfig> &storage_config)
-                -> std::shared_ptr<SdkInterface> {
+            [global_unique_name,
+             ctrl](const std::shared_ptr<SdkBackendConfig> &,
+                   const std::shared_ptr<StorageConfig> &storage_config) -> std::shared_ptr<SdkInterface> {
                 if (storage_config->global_unique_name() == global_unique_name) {
                     return std::make_shared<FakeSlowSdk>(ctrl);
                 }
@@ -147,12 +150,9 @@ protected:
             init_params_);
     }
 
-    DataStorageUri MakeUri(const std::string &host,
-                           const std::string &path_suffix,
-                           size_t blkid,
-                           size_t size) {
-        return DataStorageUri("file://" + host + "/" + root_path_ + "/" + path_suffix + "?blkid=" +
-                              std::to_string(blkid) + "&size=" + std::to_string(size));
+    DataStorageUri MakeUri(const std::string &host, const std::string &path_suffix, size_t blkid, size_t size) {
+        return DataStorageUri("file://" + host + "/" + root_path_ + "/" + path_suffix +
+                              "?blkid=" + std::to_string(blkid) + "&size=" + std::to_string(size));
     }
 
     // CPU BlockBuffers：每个 block 一块 malloc 内存，可指定初始字节。
@@ -216,6 +216,9 @@ protected:
         }
     };
 
+    // 由毫秒预算构造显式 deadline_us（绝对 steady_clock 微秒，契约 §2 语义）。
+    static int64_t DeadlineFromNowMs(int64_t timeout_ms) { return SteadyClockUs() + timeout_ms * 1000; }
+
     // 事件轮询等待（替代 sleep 同步；给足余量，绝不依赖"恰好 X ms 后"）。
     static bool WaitFor(const std::atomic<bool> &flag, int timeout_ms) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -257,17 +260,15 @@ TEST_F(SdkTimeoutContractTest, TestRunningTimeoutBoundedReturn) {
     RegisterFakeForTest("nfs_test", ctrl);
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeSingleFileStorageConfigs("nfs_test")));
 
     auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
     auto buffers = TestBuffers::Make(1, 1024);
 
     auto start = std::chrono::steady_clock::now();
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
-    int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(200));
+    int64_t elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
     // 宽松上界：明显小于 fake 的 3s 睡眠（而不是精确 200ms），证明没有 drain/等待 in-flight。
@@ -293,8 +294,7 @@ TEST_F(SdkTimeoutContractTest, TestQueuedTaskNeverStartsIo) {
 
     // thread_num=1：占满唯一工作线程后，后到的 Get 任务必然在队列里等过 deadline（50ms）。
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 1, 2000, 2000, 50, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 1, 2000, 2000, 50, MakeSingleFileStorageConfigs("nfs_test")));
 
     // 占住唯一线程 500ms（远大于 50ms deadline）。
     auto blocker = sdk_wrapper.wait_task_thread_pool_->async([]() -> ClientErrorCode {
@@ -306,10 +306,9 @@ TEST_F(SdkTimeoutContractTest, TestQueuedTaskNeverStartsIo) {
     auto buffers = TestBuffers::Make(1, 1024);
 
     auto start = std::chrono::steady_clock::now();
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
-    int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(50));
+    int64_t elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
     // 核心断言：目标 fake 的 Get 从未被调用（I/O 未发起），返回超时。
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
@@ -324,20 +323,19 @@ TEST_F(SdkTimeoutContractTest, TestQueuedTaskNeverStartsIo) {
     ASSERT_EQ(ER_OK, blocker.get());
 }
 
-// 3.2 变体：已过期 deadline 直接走 wrapper 路径（get_timeout_ms=0 → deadline == 提交时刻）。
+// 3.2 变体：显式传入已过期的 deadline_us（绝对时间点早于当前时刻）。
 // 任务无论何时被拾起，now >= deadline 恒成立 → 准入检查必然拦截，SDK 从未被调用。
 TEST_F(SdkTimeoutContractTest, TestPreExpiredDeadlineRejectsBeforeIo) {
     auto ctrl = std::make_shared<FakeSlowSdkControl>();
     RegisterFakeForTest("nfs_test", ctrl);
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 2, 2000, 2000, 0, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 2, 2000, 2000, 0, MakeSingleFileStorageConfigs("nfs_test")));
 
     auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
     auto buffers = TestBuffers::Make(1, 1024);
 
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, SteadyClockUs() - 1);
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
     ASSERT_EQ(0, ctrl->get_call_count.load());
     // 任务最终必然被某个工作线程拾起并触发准入拒绝（now >= deadline 恒成立），轮询确认。
@@ -356,8 +354,7 @@ TEST_F(SdkTimeoutContractTest, TestHardContractNoBackgroundWriteAfterReturn) {
     // 不注册 fake：使用真实 LocalFileSdk（hard 级后端）。deadline 设短（200ms），
     // 多 block Get 的正常耗时在 ms 级，必然在 deadline 前完成（ER_OK 路径）。
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeSingleFileStorageConfigs("nfs_test")));
 
     const size_t kBlockCount = 4;
     const size_t kBlockSize = 1024;
@@ -369,12 +366,12 @@ TEST_F(SdkTimeoutContractTest, TestHardContractNoBackgroundWriteAfterReturn) {
     }
     auto put_buffers = TestBuffers::Make(kBlockCount, kBlockSize, FakeSlowSdkControl::kTouchByte);
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_OK, sdk_wrapper.Put(uris, put_buffers.buffers, actual_remote_uris));
+    ASSERT_EQ(ER_OK, sdk_wrapper.Put(uris, put_buffers.buffers, actual_remote_uris, DeadlineFromNowMs(200)));
     ASSERT_EQ(kBlockCount, actual_remote_uris->size());
 
     // Get 回读，先验证成功路径数据确实被搬运到 caller buffer。
     auto get_buffers = TestBuffers::Make(kBlockCount, kBlockSize, 0x00);
-    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, get_buffers.buffers));
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, get_buffers.buffers, DeadlineFromNowMs(200)));
     for (size_t i = 0; i < kBlockCount; ++i) {
         ASSERT_TRUE(get_buffers.BlockBytesEqual(i, FakeSlowSdkControl::kTouchByte));
     }
@@ -398,18 +395,17 @@ TEST_F(SdkTimeoutContractTest, TestHardContractNoBackgroundWriteAfterReturn) {
 // 若未来有人给 fake 对应的后端引入"返回后写 buffer"，此测试变红。
 TEST_F(SdkTimeoutContractTest, TestHardBackendNoWriteAfterTimeoutReturn) {
     auto ctrl = std::make_shared<FakeSlowSdkControl>();
-    ctrl->get_delay_ms.store(3000); // 超时返回后任务仍在后台睡眠
+    ctrl->get_delay_ms.store(3000);        // 超时返回后任务仍在后台睡眠
     ctrl->touch_buffer_on_get.store(true); // hard 后端：只在返回前写（同步交付）
     RegisterFakeForTest("nfs_test", ctrl);
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeSingleFileStorageConfigs("nfs_test")));
 
     auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
     auto buffers = TestBuffers::Make(1, 1024, 0x00);
 
-    ASSERT_EQ(ER_SDK_TIMEOUT, sdk_wrapper.Get(uris, buffers.buffers));
+    ASSERT_EQ(ER_SDK_TIMEOUT, sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(200)));
 
     // 返回后立即覆写哨兵；等待期间 fake 的 sleep（3s）在后台结束。
     constexpr uint8_t kSentinel = 0xA5;
@@ -435,18 +431,17 @@ TEST_F(SdkTimeoutContractTest, TestHardBackendNoWriteAfterTimeoutReturn) {
 //  2) 违约写入确实发生了（write_done 事件 + buffer 内容被写脏）。
 TEST_F(SdkTimeoutContractTest, TestSoftBackendViolationIsObservable) {
     auto ctrl = std::make_shared<FakeSlowSdkControl>();
-    ctrl->get_delay_ms.store(500); // wrapper 200ms 超时后，fake 还在后台运行
+    ctrl->get_delay_ms.store(500);        // wrapper 200ms 超时后，fake 还在后台运行
     ctrl->write_after_return.store(true); // 违约：sleep 结束后仍写 caller buffer
     RegisterFakeForTest("nfs_test", ctrl);
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeSingleFileStorageConfigs("nfs_test")));
 
     auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
     auto buffers = TestBuffers::Make(1, 1024, 0x00);
 
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(200));
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
     // 超时记录在返回时已可见：观测存在，违约被归因。
     ASSERT_TRUE(WaitForStatsSubstring("timeout_count: local_file/get=1"));
@@ -459,25 +454,25 @@ TEST_F(SdkTimeoutContractTest, TestSoftBackendViolationIsObservable) {
 }
 
 // ============================================================================
-// 3.5 deadline 传播
+// 3.5 deadline 透传
 // ============================================================================
-// fake 在 Get 内观测 SdkDeadline：必须有值，且 RemainingMs() 落在 (0, timeout_ms]。
-// W1/W2/W3 的逐 block/逐 key 准入依赖此机制；若 Scope 失效，本测试变红。
+// fake 在 Get 内观测传入的 deadline_us：必须有值，且 RemainingMs() 落在 (0, timeout_ms]。
+// W1/W2/W3 的逐 block/逐 key 准入依赖显式参数透传；若 SdkWrapper 忘记把 deadline
+// 传进 SDK，本测试变红。
 TEST_F(SdkTimeoutContractTest, TestDeadlinePropagationIntoSdk) {
     auto ctrl = std::make_shared<FakeSlowSdkControl>();
     RegisterFakeForTest("nfs_test", ctrl);
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 8, 2000, 2000, 2000, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 2000, MakeSingleFileStorageConfigs("nfs_test")));
 
     auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
     auto buffers = TestBuffers::Make(1, 1024);
 
-    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, buffers.buffers));
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(2000)));
     ASSERT_EQ(1, ctrl->get_call_count.load());
-    // fake 在池内任务线程中读取 deadline：必须有值，且剩余时间在 (0, timeout_ms] 区间。
-    ASSERT_TRUE(ctrl->deadline_has_value.load());
+    // fake 在池内任务线程中读取传入的 deadline_us：必须有值，且剩余时间在 (0, timeout_ms] 区间。
+    ASSERT_TRUE(ctrl->deadline_set.load());
     int64_t remaining_ms = ctrl->deadline_remaining_ms.load();
     ASSERT_GT(remaining_ms, 0);
     ASSERT_LE(remaining_ms, 2000);
@@ -495,8 +490,7 @@ TEST_F(SdkTimeoutContractTest, TestPerBlockAdmissionStopsMidway) {
     RegisterFakeForTest("nfs_test", ctrl);
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 8, 2000, 2000, 50, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 50, MakeSingleFileStorageConfigs("nfs_test")));
 
     const size_t kBlockCount = 4;
     std::vector<DataStorageUri> uris;
@@ -505,7 +499,7 @@ TEST_F(SdkTimeoutContractTest, TestPerBlockAdmissionStopsMidway) {
     }
     auto buffers = TestBuffers::Make(kBlockCount, 1024, 0x00);
 
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(50));
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
     ASSERT_TRUE(WaitForStatsSubstring("timeout_count: local_file/get=1"));
 
@@ -538,9 +532,9 @@ TEST_F(SdkTimeoutContractTest, TestMixedBackendsFastCompletesSlowTimesOut) {
 
     SdkFactory::GetInstance()->RegisterCustomCreatorForTest(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
-        [kFastHost, kSlowHost, fast_ctrl, slow_ctrl](const std::shared_ptr<SdkBackendConfig> &,
-                                                     const std::shared_ptr<StorageConfig> &storage_config)
-            -> std::shared_ptr<SdkInterface> {
+        [kFastHost, kSlowHost, fast_ctrl, slow_ctrl](
+            const std::shared_ptr<SdkBackendConfig> &,
+            const std::shared_ptr<StorageConfig> &storage_config) -> std::shared_ptr<SdkInterface> {
             if (storage_config->global_unique_name() == kFastHost) {
                 return std::make_shared<FakeSlowSdk>(fast_ctrl);
             }
@@ -551,8 +545,7 @@ TEST_F(SdkTimeoutContractTest, TestMixedBackendsFastCompletesSlowTimesOut) {
         });
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK,
-              InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeDualFileStorageConfigs(kFastHost, kSlowHost)));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 200, MakeDualFileStorageConfigs(kFastHost, kSlowHost)));
 
     // 快组在前：wrapper 先等到快组 future 就绪，再等慢组 → deadline 到期 → 超时返回。
     std::vector<DataStorageUri> uris = {
@@ -561,7 +554,7 @@ TEST_F(SdkTimeoutContractTest, TestMixedBackendsFastCompletesSlowTimesOut) {
     };
     auto buffers = TestBuffers::Make(2, 1024, 0x00);
 
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(200));
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
     // 快后端已完成：被调用 1 次，其 caller buffer 已被写满 kTouchByte（结果完整可用，
     // 不因慢后端超时而受影响）。
