@@ -9,9 +9,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_api.h"
-#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
@@ -35,7 +35,7 @@ Hf3fsUsrbioClient::~Hf3fsUsrbioClient() {
     usrbio_api_.reset();
 }
 
-bool Hf3fsUsrbioClient::Read(const std::vector<Iov> &iovs) {
+bool Hf3fsUsrbioClient::Read(const std::vector<Iov> &iovs, int64_t deadline_us) {
     int64_t read_len = 0;
     int64_t total_len = 0;
     for (const auto &iov : iovs) {
@@ -66,13 +66,13 @@ bool Hf3fsUsrbioClient::Read(const std::vector<Iov> &iovs) {
         return false;
     }
 
-    return DoRead(iovs);
+    return DoRead(iovs, deadline_us);
 }
 
-bool Hf3fsUsrbioClient::DoRead(const std::vector<Iov> &iovs) {
-    // 准入检查（01-contract.md §2）：deadline 已过期则直接返回，不发起 I/O。
-    // 无 deadline 时 Expired() 恒为 false，行为与旧版一致。
-    if (SdkDeadline::Expired()) {
+bool Hf3fsUsrbioClient::DoRead(const std::vector<Iov> &iovs, int64_t deadline_us) {
+    // 准入检查（契约 §2）：deadline 已过期则直接返回，不发起 I/O。
+    // 无 deadline（0）时 DeadlineExpired() 恒为 false，行为与旧版一致。
+    if (DeadlineExpired(deadline_us)) {
         KVCM_LOG_WARN("do read skipped, deadline expired, file: %s, iovs size: %zu", filepath_.c_str(), iovs.size());
         return false;
     }
@@ -169,7 +169,7 @@ bool Hf3fsUsrbioClient::ReadFrom3FS(const std::shared_ptr<Hf3fsHandle> &handle,
             }
 
             // submit_io_count 达到最大或者没得读
-            if (!WaitIos(handle->ior_handle, submit_io_count, /*for_read=*/true)) {
+            if (!WaitIos(handle->ior_handle, submit_io_count, deadline_us, /*for_read=*/true)) {
                 read_success = false;
                 break;
             }
@@ -184,7 +184,7 @@ bool Hf3fsUsrbioClient::ReadFrom3FS(const std::shared_ptr<Hf3fsHandle> &handle,
     return read_success;
 }
 
-bool Hf3fsUsrbioClient::Write(const std::vector<Iov> &iovs) {
+bool Hf3fsUsrbioClient::Write(const std::vector<Iov> &iovs, int64_t deadline_us) {
     const int64_t write_len = std::accumulate(
         iovs.begin(), iovs.end(), 0, [](int64_t len, const Iov &iov) { return len + (iov.ignore ? 0 : iov.size); });
     if (write_len <= 0) {
@@ -196,7 +196,7 @@ bool Hf3fsUsrbioClient::Write(const std::vector<Iov> &iovs) {
         return false;
     }
 
-    if (!DoWrite(iovs)) {
+    if (!DoWrite(iovs, deadline_us)) {
         Close();
         return false;
     }
@@ -206,10 +206,10 @@ bool Hf3fsUsrbioClient::Write(const std::vector<Iov> &iovs) {
     return true;
 }
 
-bool Hf3fsUsrbioClient::DoWrite(const std::vector<Iov> &iovs) {
-    // 准入检查（01-contract.md §2）：deadline 已过期则不做 CopyIovs 也不发起 I/O。
-    // 无 deadline 时 Expired() 恒为 false，行为与旧版一致。
-    if (SdkDeadline::Expired()) {
+bool Hf3fsUsrbioClient::DoWrite(const std::vector<Iov> &iovs, int64_t deadline_us) {
+    // 准入检查（契约 §2）：deadline 已过期则不做 CopyIovs 也不发起 I/O。
+    // 无 deadline（0）时 DeadlineExpired() 恒为 false，行为与旧版一致。
+    if (DeadlineExpired(deadline_us)) {
         KVCM_LOG_WARN("do write skipped, deadline expired, file: %s, iovs size: %zu", filepath_.c_str(), iovs.size());
         return false;
     }
@@ -297,7 +297,7 @@ bool Hf3fsUsrbioClient::WriteTo3FS(const std::shared_ptr<Hf3fsHandle> &handle,
                 break;
             }
 
-            if (!WaitIos(handle->ior_handle, submit_io_count, /*for_read=*/false)) {
+            if (!WaitIos(handle->ior_handle, submit_io_count, deadline_us, /*for_read=*/false)) {
                 write_success = false;
                 break;
             }
@@ -315,6 +315,7 @@ bool Hf3fsUsrbioClient::WriteTo3FS(const std::shared_ptr<Hf3fsHandle> &handle,
 
 bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle,
                                 int32_t submit_io_count,
+                                int64_t deadline_us,
                                 bool for_read) const {
     if (ior_handle.ior == nullptr) {
         return false;
@@ -324,8 +325,9 @@ bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle,
     auto ior = ior_handle.ior;
     const auto ior_entries = ior_handle.ior_entries;
 
-    // 有 deadline 时把 SdkDeadline::RemainingMs() 换算成 abs_timeout 传给 hf3fs_wait_for_ios，
-    // 使等待有界（01-contract.md §1）；无 deadline 时传 nullptr，保持旧行为（无限等待）。
+    // 有 deadline 时把 DeadlineRemainingMs(deadline_us) 换算成 abs_timeout 传给
+    // hf3fs_wait_for_ios，使等待有界（契约 §1）；无 deadline（0）时传 nullptr，
+    // 保持旧行为（无限等待）。
     //
     // 时钟基准（实证，勿改）：本仓库链接的 libhf3fs_api_shared-1.2.1 由
     // deepseek-ai/3FS@f6395e7d（open_source/package/build-hf3fs-usrbio-rpm.sh）构建，其
@@ -333,10 +335,10 @@ bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle,
     // abs_timeout 逐字段比较，并经 sem_timedwait 等待（POSIX 规定 sem_timedwait 的绝对
     // 超时同样以 CLOCK_REALTIME 为基准）。因此 abs_timeout 必须用 CLOCK_REALTIME 计算；
     // 若误用 CLOCK_MONOTONIC（epoch 不同），abs_timeout 会被视为早已过期，所有带
-    // deadline 的 3FS I/O 立即超时。SdkDeadline 的 steady_clock::time_point 不能直接
-    // 当作 timespec 使用，必须先取当前墙钟时间再叠加剩余预算。
-    int64_t remaining_ms = SdkDeadline::RemainingMs();
-    struct timespec abs_timeout {};
+    // deadline 的 3FS I/O 立即超时。deadline_us 是 CLOCK_MONOTONIC 的绝对时间点，
+    // 不能直接当作 timespec 使用，必须先取当前墙钟时间再叠加剩余预算。
+    int64_t remaining_ms = DeadlineRemainingMs(deadline_us);
+    struct timespec abs_timeout{};
     const struct timespec *abs_timeout_ptr = nullptr;
     if (remaining_ms >= 0) {
         if (clock_gettime(CLOCK_REALTIME, &abs_timeout) != 0) {
@@ -360,8 +362,7 @@ bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle,
         }
     }
 
-    int completed_io_count =
-        usrbio_api_->Hf3fsWaitForIos(ior, cqes, submit_io_count, submit_io_count, abs_timeout_ptr);
+    int completed_io_count = usrbio_api_->Hf3fsWaitForIos(ior, cqes, submit_io_count, submit_io_count, abs_timeout_ptr);
     if (completed_io_count < 0) {
         KVCM_LOG_WARN("wait io failed, 3fs wait for ios failed, errno: %s, file: %s, read: %d, submit ios: %d, "
                       "ior entries: %d, remaining ms: %lld",

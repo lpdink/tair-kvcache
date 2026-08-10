@@ -47,8 +47,8 @@ public:
     ~Hf3fsUsrbioClient();
 
 public:
-    bool Read(const std::vector<Iov> &iovs);
-    bool Write(const std::vector<Iov> &iovs);
+    bool Read(const std::vector<Iov> &iovs, int64_t deadline_us);
+    bool Write(const std::vector<Iov> &iovs, int64_t deadline_us);
 
 private:
     struct Segment {
@@ -57,14 +57,15 @@ private:
     };
 
     // read related
-    bool DoRead(const std::vector<Iov> &iovs);
+    bool DoRead(const std::vector<Iov> &iovs, int64_t deadline_us);
     bool ReadFrom3FS(const std::shared_ptr<Hf3fsHandle> &handle, const std::vector<Segment> &segments) const;
 
     // write related
-    bool DoWrite(const std::vector<Iov> &iovs);
+    bool DoWrite(const std::vector<Iov> &iovs, int64_t deadline_us);
     bool WriteTo3FS(const std::shared_ptr<Hf3fsHandle> &handle, const std::vector<Segment> &segments);
     // for_read 仅用于超时/失败日志归因（read/write）
-    bool WaitIos(const Hf3fsIorHandle &ior_handle, int32_t submit_io_count, bool for_read = true) const;
+    bool
+    WaitIos(const Hf3fsIorHandle &ior_handle, int32_t submit_io_count, int64_t deadline_us, bool for_read = true) const;
 
     // iov/ior related
     std::vector<Segment> BuildContiguousSegments(const std::vector<Iov> &iovs) const;

@@ -73,11 +73,6 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
 
-        // Init 级 timeout 透传：各 SDK 在 Init 时可读取 get/put_timeout_ms（统一入口）。
-        // 注意：PACE 等后端的 timeout 是进程级配置（如 TAIR_MEMPOOL_CLIENT_IO_TIMEOUT_MS），
-        // 此处仅是 kvcm 侧的统一入口；SDK 内部主要使用 SdkDeadline 做逐 block/逐 key 准入检查。
-        sdk_backend_config->set_timeout_config(wrapper_config_->timeout_config());
-
         auto sdk = sdk_factory_->CreateSdk(type, sdk_backend_config, storage_config);
         if (!sdk) {
             KVCM_LOG_WARN("create sdk failed, storage config: %s", storage_config->ToString().c_str());
@@ -116,7 +111,9 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
     return ER_OK;
 }
 
-ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
+ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
+                                const BlockBuffers &local_buffers,
+                                int64_t deadline_us) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         return ec;
@@ -131,8 +128,11 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, 
     std::vector<TimedTask> timed_tasks;
     timed_tasks.reserve(groups.size());
     int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
-    // deadline 在调用入口计算一次，向下传播（线程池准入检查 + SDK 内部逐 block 检查共用）。
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    // deadline 来源：调用方显式传入的 deadline_us（绝对 steady_clock 微秒）。
+    // deadline_us == 0（调用方不施加 deadline）时回退到 wrapper 级 timeout_config
+    // 计算（旧行为，向后兼容）；否则直接用传入值，不再从 timeout_config 推算。
+    auto deadline = (deadline_us > 0) ? std::chrono::steady_clock::time_point(std::chrono::microseconds(deadline_us))
+                                      : std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     for (size_t i = 0; i < groups.size(); ++i) {
         const auto &group = groups[i];
@@ -142,7 +142,7 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, 
         task.group_count = groups.size();
         task.block_count = group.uris.size();
         // Capture group by value to prevent use-after-free on timeout
-        task.fn = [group]() { return group.sdk->Get(group.uris, group.buffers); };
+        task.fn = [group, deadline_us]() { return group.sdk->Get(group.uris, group.buffers, deadline_us); };
         timed_tasks.push_back(std::move(task));
     }
     return RunWithTimeoutParallel(OpType::GET, std::move(timed_tasks), deadline, timeout_ms);
@@ -150,7 +150,8 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, 
 
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
                                 const BlockBuffers &local_buffers,
-                                std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+                                std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                int64_t deadline_us) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, remote_uris or local_buffers invalid.");
@@ -169,8 +170,9 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     timed_tasks.reserve(groups.size());
     group_results.reserve(groups.size());
     int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
-    // deadline 在调用入口计算一次，向下传播（线程池准入检查 + SDK 内部逐 block 检查共用）。
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    // deadline 来源：调用方显式传入的 deadline_us；0 时回退到 wrapper 级 timeout_config（见 Get）。
+    auto deadline = (deadline_us > 0) ? std::chrono::steady_clock::time_point(std::chrono::microseconds(deadline_us))
+                                      : std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     for (size_t i = 0; i < groups.size(); ++i) {
         const auto &group = groups[i];
@@ -182,8 +184,8 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         task.group_count = groups.size();
         task.block_count = group.uris.size();
         // Capture group by value to prevent use-after-free on timeout
-        task.fn = [group, group_actual_uris]() {
-            return group.sdk->Put(group.uris, group.buffers, group_actual_uris);
+        task.fn = [group, group_actual_uris, deadline_us]() {
+            return group.sdk->Put(group.uris, group.buffers, group_actual_uris, deadline_us);
         };
         timed_tasks.push_back(std::move(task));
     }
@@ -198,7 +200,7 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     for (size_t i = 0; i < groups.size(); ++i) {
         const auto &group = groups[i];
         const auto &group_actual_uris = group_results[i];
-        
+
         if (group_actual_uris->size() != group.indices.size()) {
             KVCM_LOG_WARN("sdk returned mismatched actual_uris size: %zu vs %zu",
                           group_actual_uris->size(),
@@ -257,7 +259,7 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
 
 ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                                                    std::vector<TimedTask> &&tasks,
-                                                   SdkDeadline::TimePoint deadline,
+                                                   std::chrono::steady_clock::time_point deadline,
                                                    int timeout_ms) const {
     if (tasks.empty()) {
         return ER_OK;
@@ -265,8 +267,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
 
     // Check capacity before submitting any tasks
     if (wait_task_thread_pool_->isFull()) {
-        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full",
-                      getOpTypeString(op_type).c_str());
+        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full", getOpTypeString(op_type).c_str());
         return ER_THREADPOOL_ERROR;
     }
 
@@ -286,9 +287,9 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
         // 对已启动任务无效），保持单一事实来源。
         auto wrapped = [deadline, timeout_ms, op_str, is_get, task]() -> ClientErrorCode {
             if (std::chrono::steady_clock::now() >= deadline) {
-                auto overdue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::steady_clock::now() - deadline)
-                                      .count();
+                auto overdue_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
+                        .count();
                 SdkIoStats::Instance().OnAdmissionReject(task.sdk_type, is_get, overdue_ms);
                 KVCM_LOG_WARN("sdk admission reject: backend=%s op=%s timeout_ms=%d overdue_ms=%lld group=%zu/%zu "
                               "blocks=%zu, deadline already passed, skip I/O to protect caller buffer",
@@ -301,8 +302,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                               task.block_count);
                 return ER_SDK_TIMEOUT;
             }
-            // 把 deadline 传播给 SDK 内部（逐 block/逐 key 准入检查用，见 sdk_deadline.h）。
-            SdkDeadline::Scope scope(deadline);
+            // 把 deadline 传给 SDK 内部（作为 Get/Put 参数做逐 block/逐 key 准入检查）。
             return task.fn();
         };
         futures.push_back(wait_task_thread_pool_->async(std::move(wrapped)));
@@ -315,9 +315,8 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     for (size_t i = 0; i < futures.size(); ++i) {
         if (futures[i].wait_until(deadline) != std::future_status::ready) {
             const auto &task = tasks[i];
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  std::chrono::steady_clock::now() - start)
-                                  .count();
+            auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
             SdkIoStats::Instance().OnTimeout(task.sdk_type, is_get, elapsed_ms, /*done=*/i, tasks.size());
             KVCM_LOG_WARN("run %s parallel timeout: backend=%s op=%s timeout_ms=%d elapsed_ms=%lld group=%zu/%zu "
                           "blocks=%zu, return immediately without waiting in-flight I/O",

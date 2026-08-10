@@ -24,7 +24,7 @@ namespace kv_cache_manager {
 //
 // 本版本不引入 staging buffer（会给 happy path 增加一次 memcpy 并放弃 mooncake
 // 唯一的零拷贝优势），而是：
-//   1) 逐 key 准入检查：每次 mooncake_client_get/put 之前检查 SdkDeadline，
+//   1) 逐 key 准入检查：每次 mooncake_client_get/put 之前检查传入的 deadline_us，
 //      把超时时刻的暴露面限制为最多 1 个 block（见 Get/Put 内注释）；
 //   2) 超时路径输出可归因日志 + SdkIoStats::OnUnsafeReturn 计数
 //      （sdk_unsafe_return_count 是决定未来是否做 staging 的判据，
@@ -40,11 +40,14 @@ public:
     ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                          const std::shared_ptr<StorageConfig> &storage_config) override;
     SdkType Type() override;
-    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) override;
+    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris,
+                        const BlockBuffers &local_buffers,
+                        int64_t deadline_us) override;
 
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
-                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) override;
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                        int64_t deadline_us) override;
 
 protected:
     ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,

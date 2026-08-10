@@ -42,8 +42,7 @@ public:
 
     bool operator==(const SdkBackendConfig &other) const {
         return type_ == other.type_ && sdk_log_file_path_ == other.sdk_log_file_path_ &&
-               sdk_log_level_ == other.sdk_log_level_ && spec_byte_sizes_per_block_ == other.spec_byte_sizes_per_block_ &&
-               timeout_config_ == other.timeout_config_;
+               sdk_log_level_ == other.sdk_log_level_ && spec_byte_sizes_per_block_ == other.spec_byte_sizes_per_block_;
     }
 
     bool operator!=(const SdkBackendConfig &other) const { return !(*this == other); }
@@ -52,7 +51,6 @@ public:
     const std::string &sdk_log_file_path() const { return sdk_log_file_path_; }
     const std::string &sdk_log_level() const { return sdk_log_level_; }
     const std::map<std::string, int64_t> &spec_byte_sizes_per_block() const { return spec_byte_sizes_per_block_; }
-    const SdkTimeoutConfig &timeout_config() const { return timeout_config_; }
 
     void set_type(DataStorageType type) { type_ = type; }
     void set_sdk_log_file_path(const std::string &value) { sdk_log_file_path_ = value; }
@@ -60,17 +58,12 @@ public:
     void set_spec_byte_sizes_per_block(const std::map<std::string, int64_t> &value) {
         spec_byte_sizes_per_block_ = value;
     }
-    // Init 级 timeout 透传：SdkWrapper 在 Init 时把 SdkTimeoutConfig 下传给各 SDK。
-    // 注意 PACE 等后端的 timeout 是进程级配置（TAIR_MEMPOOL_CLIENT_IO_TIMEOUT_MS），
-    // 此处是 kvcm 侧的统一入口；SDK 内部主要用 SdkDeadline 做逐 block/逐 key 准入检查。
-    void set_timeout_config(const SdkTimeoutConfig &timeout_config) { timeout_config_ = timeout_config; }
 
 private:
     DataStorageType type_;
     std::string sdk_log_file_path_;
     std::string sdk_log_level_;
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
-    SdkTimeoutConfig timeout_config_;
 };
 
 class Hf3fsSdkConfig : public SdkBackendConfig {

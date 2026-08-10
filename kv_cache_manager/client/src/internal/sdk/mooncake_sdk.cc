@@ -4,7 +4,7 @@
 #include <random>
 #include <sstream>
 
-#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_io_stats.h"
 
 namespace kv_cache_manager {
@@ -133,7 +133,9 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
 
 SdkType MooncakeSdk::Type() { return SdkType::MOONCAKE; }
 
-ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffer) {
+ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
+                                 const BlockBuffers &local_buffer,
+                                 int64_t deadline_us) {
     if (remote_uris.size() != local_buffer.size()) {
         KVCM_LOG_ERROR("mooncake get failed, remote_uris size not equal to local_buffer size");
         return ER_INVALID_PARAMS;
@@ -169,14 +171,14 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
         }
         // ============================================================
         // 逐 key 准入检查（核心）：slices 直接指向 caller 的 iov.base，网卡 DMA 直接
-        // 写 caller 内存，而上游无法取消已下发的传输（00-context.md §4 三重实证）。
-        // 因此在每次 mooncake_client_get 之前检查 deadline：已过期立即返回超时、
+        // 写 caller 内存，而上游无法取消已下发的传输（契约 §3 三重实证）。
+        // 因此在每次 mooncake_client_get 之前检查 deadline_us：已过期立即返回超时、
         // 不发这次 I/O。效果：超时时刻最多只有 1 个 block 的 DMA 在飞（正在执行的
         // 那次），其余全部未发起 —— 暴露面从 128 个 block 降到 ≤1 个（降两个数量级）。
         // 这个检查看似"每个 key 都查一次"很啰嗦，但正是它把静默污染窗口关到最小；
         // 删掉它，超时后 128 个 block 全部可能仍在写 caller buffer。
         // ============================================================
-        if (SdkDeadline::Expired()) {
+        if (DeadlineExpired(deadline_us)) {
             const void *caller_buffer = nullptr;
             for (const auto &iov : local_buffer[i].iovs) {
                 if (iov.base != nullptr) {
@@ -184,12 +186,19 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
                     break;
                 }
             }
-            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::steady_clock::now() - call_start)
-                                        .count();
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - call_start)
+                    .count();
             // 已下发的 blocks [0, i) 可能仍有在飞 DMA 写 caller buffer，返回后无法保证安全。
-            LogSoftTimeout(/*is_get=*/true, /*done=*/i, remote_uris.size(), i, item.key, caller_buffer, read_len,
-                           elapsed_ms, SdkDeadline::RemainingMs());
+            LogSoftTimeout(/*is_get=*/true,
+                           /*done=*/i,
+                           remote_uris.size(),
+                           i,
+                           item.key,
+                           caller_buffer,
+                           read_len,
+                           elapsed_ms,
+                           DeadlineRemainingMs(deadline_us));
             // sdk_unsafe_return_count 的判据来源（01-contract.md §4.2：决定是否做 staging）。
             SdkIoStats::Instance().OnUnsafeReturn(SdkType::MOONCAKE, /*is_get=*/true, /*inflight_blocks=*/i);
             return ER_SDK_TIMEOUT;
@@ -205,7 +214,8 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
 
 ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                                  const BlockBuffers &local_buffers,
-                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                 int64_t deadline_us) {
     actual_remote_uris->clear();
     std::vector<Slice_t> slices;
     if (remote_uris.size() != local_buffers.size()) {
@@ -242,10 +252,10 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
         // ============================================================
         // 逐 key 准入检查（与 Get 同理，见上）：put 时网卡 DMA 读 caller 内存，
         // 超时返回后若 caller 复用/改写该内存，与在飞 DMA 构成数据竞争；上游无法
-        // 取消，因此每次 mooncake_client_put 之前必须检查 deadline，已过期立即返回。
+        // 取消，因此每次 mooncake_client_put 之前必须检查 deadline_us，已过期立即返回。
         // 效果：暴露面从 128 个 block 降到 ≤1 个。
         // ============================================================
-        if (SdkDeadline::Expired()) {
+        if (DeadlineExpired(deadline_us)) {
             const void *caller_buffer = nullptr;
             for (const auto &iov : local_buffers[i].iovs) {
                 if (iov.base != nullptr) {
@@ -253,11 +263,18 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                     break;
                 }
             }
-            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::steady_clock::now() - call_start)
-                                        .count();
-            LogSoftTimeout(/*is_get=*/false, /*done=*/i, remote_uris.size(), i, item.key, caller_buffer, write_len,
-                           elapsed_ms, SdkDeadline::RemainingMs());
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - call_start)
+                    .count();
+            LogSoftTimeout(/*is_get=*/false,
+                           /*done=*/i,
+                           remote_uris.size(),
+                           i,
+                           item.key,
+                           caller_buffer,
+                           write_len,
+                           elapsed_ms,
+                           DeadlineRemainingMs(deadline_us));
             SdkIoStats::Instance().OnUnsafeReturn(SdkType::MOONCAKE, /*is_get=*/false, /*inflight_blocks=*/i);
             return ER_SDK_TIMEOUT;
         }

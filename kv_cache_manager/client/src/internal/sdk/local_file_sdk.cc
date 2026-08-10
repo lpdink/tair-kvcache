@@ -13,7 +13,7 @@
 #elif defined(USING_MUSA)
 #include "kv_cache_manager/client/src/internal/sdk/musa_util.h"
 #endif
-#include "kv_cache_manager/client/src/internal/sdk/sdk_deadline.h"
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
 
@@ -118,14 +118,15 @@ private:
 #endif
 };
 
-// 超时中止路径的可归因日志（01-contract.md §4.1 必带字段）：
+// 超时中止路径的可归因日志（契约 §4.1 必带字段）：
 // backend / op / 剩余预算 / 完成块数 / 在飞块下标与 caller buffer 地址。
 // deadline_remaining_ms <= 0 表示已过期。LocalFile 是 hard 级后端（buffer_level=hard）。
 void LogTimeoutAbort(const char *op,
                      size_t done_blocks,
                      size_t total_blocks,
                      size_t in_flight_block,
-                     const kv_cache_manager::BlockBuffer &in_flight_buffer) {
+                     const kv_cache_manager::BlockBuffer &in_flight_buffer,
+                     int64_t deadline_remaining_ms) {
     std::string buf_addrs;
     for (const auto &iov : in_flight_buffer.iovs) {
         char addr[32];
@@ -138,7 +139,7 @@ void LogTimeoutAbort(const char *op,
     KVCM_LOG_ERROR("local file sdk timeout abort: backend=local_file op=%s deadline_remaining_ms=%lld "
                    "done_blocks=%zu/%zu in_flight_block=%zu caller_buffer_addrs=[%s] buffer_level=hard",
                    op,
-                   static_cast<long long>(kv_cache_manager::SdkDeadline::RemainingMs()),
+                   static_cast<long long>(deadline_remaining_ms),
                    done_blocks,
                    total_blocks,
                    in_flight_block,
@@ -164,9 +165,13 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterSupported, dev), false, "get cudaDevAttrHostRegisterSupported failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterSupported, dev),
+                                false,
+                                "get cudaDevAttrHostRegisterSupported failed");
 #elif defined(USING_MUSA)
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterSupported, dev), false, "get musaDevAttrHostRegisterSupported failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterSupported, dev),
+                                false,
+                                "get musaDevAttrHostRegisterSupported failed");
 #endif
         if (value != 1) {
             return false;
@@ -184,9 +189,13 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, dev), false, "get cudaDevAttrHostRegisterReadOnlySupported failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, dev),
+                                false,
+                                "get cudaDevAttrHostRegisterReadOnlySupported failed");
 #elif defined(USING_MUSA)
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev), false, "get musaDevAttrHostRegisterReadOnlySupported failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev),
+                                false,
+                                "get musaDevAttrHostRegisterReadOnlySupported failed");
 #endif
         if (value != 1) {
             return false;
@@ -206,10 +215,14 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrPageableMemoryAccess, dev), false, "get cudaDevAttrPageableMemoryAccess failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrPageableMemoryAccess, dev),
+                                false,
+                                "get cudaDevAttrPageableMemoryAccess failed");
 #elif defined(USING_MUSA)
         // MUSA equivalent - adjust if needed
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrPageableMemoryAccess, dev), false, "get musaDevAttrPageableMemoryAccess failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrPageableMemoryAccess, dev),
+                                false,
+                                "get musaDevAttrPageableMemoryAccess failed");
 #endif
         if (value != 1) {
             return false;
@@ -263,7 +276,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
-    
+
     // Check if GPUs support direct pageable memory access
     // If true, we can skip cudaHostRegister for mmap'd memory
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
@@ -279,7 +292,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
-    
+
     // Check if GPUs support direct pageable memory access
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
     KVCM_LOG_INFO("gpu support pageable memory access [%d]", static_cast<int>(support_pageable_memory_access_));
@@ -289,7 +302,9 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
 SdkType LocalFileSdk::Type() { return SdkType::LOCAL_FILE; }
 
-ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
+ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris,
+                                  const BlockBuffers &local_buffers,
+                                  int64_t deadline_us) {
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_ERROR("Get failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
@@ -297,14 +312,18 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
     auto group_map = SplitByPath(remote_uris, local_buffers);
     size_t done_blocks = 0;
     for (const auto &group : group_map) {
-        // 组级准入（01-contract.md §2 第2条）：deadline 已过则不再为后续组做
+        // 组级准入（契约 §2 第2条）：deadline 已过则不再为后续组做
         // open/mmap 等准备工作，直接返回超时。
-        if (SdkDeadline::Expired()) {
-            LogTimeoutAbort("get", done_blocks, remote_uris.size(), group.second.indices[0],
-                            group.second.local_buffers[0]);
+        if (DeadlineExpired(deadline_us)) {
+            LogTimeoutAbort("get",
+                            done_blocks,
+                            remote_uris.size(),
+                            group.second.indices[0],
+                            group.second.local_buffers[0],
+                            DeadlineRemainingMs(deadline_us));
             return ER_SDK_TIMEOUT;
         }
-        auto ec = DoGet(group.second.remote_uris, group.second.local_buffers);
+        auto ec = DoGet(group.second.remote_uris, group.second.local_buffers, deadline_us);
         if (ec == ER_SDK_TIMEOUT) {
             // 透传超时错误码，供 wrapper 层归因（不要把超时吞成普通读错误）。
             return ER_SDK_TIMEOUT;
@@ -320,12 +339,13 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
 
 ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                                   const BlockBuffers &local_buffers,
-                                  std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+                                  std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                  int64_t deadline_us) {
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
-    // 保序契约（01-contract.md §6）：actual_remote_uris[i] 必须对应 remote_uris[i]。
+    // 保序契约（契约 §6）：actual_remote_uris[i] 必须对应 remote_uris[i]。
     // 先按总大小 resize，再按 BlockGroup::indices 回填原位；禁止 clear() 后 append
     // （那会依赖 unordered_map 的迭代序，交错多 path 输入必然错位）。
     actual_remote_uris->resize(remote_uris.size());
@@ -333,9 +353,13 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
     size_t done_blocks = 0;
     for (const auto &group : group_map) {
         // 组级准入：deadline 已过则不再为后续组做 exists/Alloc/mmap 等准备工作。
-        if (SdkDeadline::Expired()) {
-            LogTimeoutAbort("put", done_blocks, remote_uris.size(), group.second.indices[0],
-                            group.second.local_buffers[0]);
+        if (DeadlineExpired(deadline_us)) {
+            LogTimeoutAbort("put",
+                            done_blocks,
+                            remote_uris.size(),
+                            group.second.indices[0],
+                            group.second.local_buffers[0],
+                            DeadlineRemainingMs(deadline_us));
             return ER_SDK_TIMEOUT;
         }
         std::string file_path = group.first;
@@ -362,7 +386,7 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
         for (size_t k = 0; k < group.second.indices.size(); ++k) {
             (*actual_remote_uris)[group.second.indices[k]] = group_actual_uris[k];
         }
-        auto ec = DoPut(group.second.remote_uris, group.second.local_buffers);
+        auto ec = DoPut(group.second.remote_uris, group.second.local_buffers, deadline_us);
         if (ec == ER_SDK_TIMEOUT) {
             // 透传超时错误码，供 wrapper 层归因（不要把超时吞成普通写错误）。
             return ER_SDK_TIMEOUT;
@@ -401,7 +425,9 @@ ClientErrorCode LocalFileSdk::Alloc(const std::vector<DataStorageUri> &remote_ur
     return ER_OK;
 }
 
-ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
+ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_uris,
+                                    const BlockBuffers &local_buffers,
+                                    int64_t deadline_us) {
     if (remote_uris.size() != local_buffers.size() || remote_uris.empty()) {
         KVCM_LOG_ERROR("Do Get failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
@@ -449,7 +475,8 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     // If GPU supports direct pageable memory access, skip cudaHostRegister
     // This allows direct DMA transfer between GPU and mmap'd memory without pinning
     if (!support_pageable_memory_access_) {
-        auto register_ec = helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
+        auto register_ec =
+            helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
         if (register_ec != ER_OK) {
             // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
@@ -461,7 +488,8 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
 #elif defined(USING_MUSA)
     GpuStreamDrainGuard gpu_drain(musa_stream_, &gpu_copy_enqueued);
     if (!support_pageable_memory_access_) {
-        auto register_ec = helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
+        auto register_ec =
+            helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
         if (register_ec != ER_OK) {
             // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
@@ -475,10 +503,15 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     char *src = static_cast<char *>(file_mem);
     // asume that url is sorted by blkid
     for (size_t i = 0; i < remote_uris.size(); ++i) {
-        // 逐 block 准入（01-contract.md §2 第2条）：deadline 已过则停止搬运，不再发起
+        // 逐 block 准入（契约 §2 第2条）：deadline 已过则停止搬运，不再发起
         // 后续 memcpy/async copy。若已有 GPU async copy 入队，guard 析构会在返回前同步。
-        if (SdkDeadline::Expired()) {
-            LogTimeoutAbort("get", /*done=*/i, remote_uris.size(), /*in_flight=*/i, local_buffers[i]);
+        if (DeadlineExpired(deadline_us)) {
+            LogTimeoutAbort("get",
+                            /*done=*/i,
+                            remote_uris.size(),
+                            /*in_flight=*/i,
+                            local_buffers[i],
+                            DeadlineRemainingMs(deadline_us));
             return ER_SDK_TIMEOUT;
         }
         auto &remote_uri = remote_uris[i];
@@ -561,7 +594,9 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     return ER_OK;
 } // namespace kv_cache_manager
 
-ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
+ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_uris,
+                                    const BlockBuffers &local_buffers,
+                                    int64_t deadline_us) {
     if (remote_uris.size() != local_buffers.size() || remote_uris.empty()) {
         KVCM_LOG_ERROR("Do Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
@@ -664,10 +699,15 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
     // url assumed sorted by blkid
     // ASSUMPTION: same as DoGet — all items in a batch must share the same `size`.
     for (size_t i = 0; i < items.size(); ++i) {
-        // 逐 block 准入（01-contract.md §2 第2条）：deadline 已过则停止搬运，不再发起
+        // 逐 block 准入（契约 §2 第2条）：deadline 已过则停止搬运，不再发起
         // 后续 memcpy/async copy。若已有 GPU async copy 入队，guard 析构会在返回前同步。
-        if (SdkDeadline::Expired()) {
-            LogTimeoutAbort("put", /*done=*/i, items.size(), /*in_flight=*/i, local_buffers[i]);
+        if (DeadlineExpired(deadline_us)) {
+            LogTimeoutAbort("put",
+                            /*done=*/i,
+                            items.size(),
+                            /*in_flight=*/i,
+                            local_buffers[i],
+                            DeadlineRemainingMs(deadline_us));
             return ER_SDK_TIMEOUT;
         }
         auto &item = items[i];
