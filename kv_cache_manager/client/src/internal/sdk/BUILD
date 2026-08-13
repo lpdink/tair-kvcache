@@ -36,6 +36,7 @@ cc_library(
     name = "sdk_common",
     srcs = ["sdk_interface.cc"],
     hdrs = [
+        "deadline_util.h",
         "sdk_interface.h",
         "sdk_type.h",
     ],
@@ -67,7 +68,6 @@ cc_library(
         "//conditions:default": [],
     }),
     hdrs = [
-        "deadline_util.h",
         "local_file_sdk.h",
         "sdk_factory.h",
         "sdk_interface.h",
@@ -92,6 +92,7 @@ cc_library(
     }),
     deps = [
         ":lock_free_thread_pool",
+        ":sdk_common",
         "//kv_cache_manager/client:common",
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/util",
