@@ -22,7 +22,8 @@ import unittest
 from e2e_lib import (
     ScenarioEnv, assert_report_ok, capture_keys, compare_captures,
     send_completions, shared_token_prefix_len, tokenize, wait_for_captures,
-    wait_for_prefix_cached,
+    wait_for_prefix_cached, assert_loaded_blocks, full_block_hashes,
+    loaded_block_count, assert_matched_in_window,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -33,7 +34,7 @@ class TestMultiTurn(unittest.TestCase):
         env = ScenarioEnv("multi_turn")
         try:
             env.start_manager()
-            vllm = env.start_vllm(log_suffix="_t1" if env.hybrid else "")
+            vllm = env.start_vllm(log_suffix="_t1" if env.multigroup else "")
             mbs = env.manager_block_size()
 
             turn1_prompt = ("A short story request. Please write a long, "
@@ -71,9 +72,9 @@ class TestMultiTurn(unittest.TestCase):
             wait_for_captures(env.capture_dir, "ref",
                               expected=env.tp_size * turn1_blocks, timeout=180)
 
-            if env.hybrid:
-                # Prefix caching is on for hybrid; restart so turn 2's hit
-                # comes from KVCM, not the local prefix cache.
+            if env.multigroup:
+                # Prefix caching is on for multi-group models; restart so turn
+                # 2's hit comes from KVCM, not the local prefix cache.
                 vllm = env.restart_vllm(log_suffix="_t2")
 
             # ---- Turn 2: conversation continues; prompt embeds turn 1's
@@ -99,16 +100,39 @@ class TestMultiTurn(unittest.TestCase):
                 f"coverage ({prompt_blocks * mbs} tokens): decode-time saves "
                 f"were not used")
 
-            # And the loaded decode-block KV must verify.
-            wait_for_captures(env.capture_dir, "loaded",
-                              expected=env.tp_size * shared_blocks, timeout=180)
-            report = compare_captures(env.capture_dir)
-            # Turn 2's stream starts with turn 1's ids, so the shared blocks
-            # are the same manager blocks on every rank.
-            assert_report_ok(
-                report, min_matched=env.tp_size * shared_blocks,
-                tp_size=env.tp_size,
-                expected_keys=capture_keys(turn2_ids, mbs, env.tp_size, shared_blocks))
+            # And the loaded decode-block KV must verify -- the loaded region
+            # is what vLLM gave slots for: the tail window of every group, plus
+            # the whole match for a full-attention group.
+            load_blocks = loaded_block_count(
+                shared_blocks * mbs, env.window, mbs, env.full_attention_group,
+                env.window_kind)
+            hashes = full_block_hashes(turn2_ids, mbs)
+            if env.window is None:
+                wait_for_captures(env.capture_dir, "loaded",
+                                  expected=env.tp_size * shared_blocks, timeout=180)
+                report = compare_captures(env.capture_dir)
+                # Turn 2's stream starts with turn 1's ids, so the shared blocks
+                # are the same manager blocks on every rank.
+                assert_report_ok(
+                    report, min_matched=env.tp_size * shared_blocks,
+                    tp_size=env.tp_size,
+                    expected_keys=capture_keys(turn2_ids, mbs, env.tp_size,
+                                               shared_blocks))
+            else:
+                # Windowed semantics: vLLM gives slots to the hit's tail
+                # window only, so the loaded region -- not the prefix -- is
+                # what has to match, block for block, on every rank.
+                loaded_keys = {(f"tp{r}", h) for r in range(env.tp_size)
+                               for h in hashes[shared_blocks - load_blocks:
+                                               shared_blocks]}
+                wait_for_captures(env.capture_dir, "loaded",
+                                  expected=len(loaded_keys), timeout=180)
+                assert_loaded_blocks(env.capture_dir, loaded_keys, env.tp_size)
+                report = compare_captures(env.capture_dir)
+                assert_report_ok(report, min_matched=len(loaded_keys),
+                                 tp_size=env.tp_size)
+                assert_matched_in_window(report, loaded_keys, env.tp_size)
+            env.assert_pinned_budget()
         finally:
             env.stop()
 
