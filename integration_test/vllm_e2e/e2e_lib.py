@@ -15,6 +15,7 @@ from lib_utils import (  # noqa: F401
     capture_keys, wait_for_prefix_cached, send_completions, count_captures,
     wait_for_captures, compare_captures, loaded_capture_keys,
     assert_loaded_blocks, assert_loaded_nonempty, assert_matched_in_window,
+    assert_no_capture_error,
     assert_pinned_ok, assert_report_ok, make_base_prompts,
     shared_token_prefix_len,
 )
